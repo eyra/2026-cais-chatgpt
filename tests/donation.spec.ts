@@ -34,6 +34,8 @@ test('reviews and submits visible ChatGPT messages from the export', async ({ pa
   await uploadChatGPTExport(page);
 
   const table = page.getByTestId('table-chatgpt_conversations_1');
+  // Labels are display-only: donated keys below stay lowercase.
+  await expect(table.getByRole('columnheader', { name: 'Message', exact: true })).toBeVisible();
   await expect(table.getByText('Newest answer')).toBeVisible();
   await expect(table.getByText('Participant question')).toBeVisible();
   await expect(table.getByText('Hidden answer')).not.toBeVisible();

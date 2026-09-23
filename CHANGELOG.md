@@ -15,6 +15,7 @@
 * Separated reference extraction from CAIS validation, twelve-month selection, sorting, and lossless table partitioning.
 * Added reference-output regression cases cross-checked against the original extractor in UTC and Europe/Amsterdam.
 * Changed study table titles to “Your conversations with ChatGPT” (with German and Dutch equivalents); omitted the title suffix for a single table while retaining part numbers for multiple tables.
+* Changed the CAIS table to show capitalized column labels (German and Dutch equivalents) and relative column widths: message widest, then conversation title. Uses the upstream display-only `headers` and `column_widths`; donated keys are unchanged.
 
 ## Unreleased
 

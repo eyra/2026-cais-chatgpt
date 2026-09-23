@@ -230,6 +230,17 @@ def prompt_consent(tables: list[pd.DataFrame]) -> list[Any]:
         "de": "Ihre Unterhaltungen mit ChatGPT",
         "nl": "Uw gesprekken met ChatGPT",
     }
+    # Display-only labels; donated keys remain the reference column names.
+    headers = {
+        "conversation title": props.Translatable(
+            {"en": "Conversation title", "de": "Titel der Unterhaltung", "nl": "Gesprekstitel"}
+        ),
+        "role": props.Translatable({"en": "Role", "de": "Rolle", "nl": "Rol"}),
+        "message": props.Translatable({"en": "Message", "de": "Nachricht", "nl": "Bericht"}),
+        "model": props.Translatable({"en": "Model", "de": "Modell", "nl": "Model"}),
+        "time": props.Translatable({"en": "Time", "de": "Zeit", "nl": "Tijd"}),
+    }
+    column_widths = {"conversation title": 3, "role": 1, "message": 6, "model": 1.2, "time": 1.8}
     consent_tables = [
         props.PropsUIPromptConsentFormTable(
             id=f"chatgpt_conversations_{number}",
@@ -249,6 +260,8 @@ def prompt_consent(tables: list[pd.DataFrame]) -> list[Any]:
             ),
             data_frame=table,
             data_frame_max_size=TABLE_ROW_LIMIT,
+            headers=headers,
+            column_widths=column_widths,
         )
         for number, table in enumerate(tables, start=1)
     ]
