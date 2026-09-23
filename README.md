@@ -71,6 +71,10 @@ and are never donated. Empty exports retain the five-column schema. Malformed
 conversation structures are rejected instead of returning a misleading empty
 success result as the original's broad exception handler could.
 
+Message text is donated exactly as the reference extracts it. This includes
+ChatGPT's inline web-citation markers (private-use characters wrapping values such
+as `cite`, `turn0search1`), which are intentionally neither removed nor rewritten.
+
 Compatibility cases in `packages/python/tests/test_chatgpt_reference.py` were
 cross-checked against the unmodified pinned extractor in UTC and Europe/Amsterdam.
 They cover nested content, alternate branches, field precedence, hidden flags,

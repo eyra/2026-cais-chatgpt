@@ -225,15 +225,19 @@ def retry_confirmation() -> props.PropsUIPromptConfirm:
 
 def prompt_consent(tables: list[pd.DataFrame]) -> list[Any]:
     table_count = len(tables)
+    titles = {
+        "en": "Your conversations with ChatGPT",
+        "de": "Ihre Unterhaltungen mit ChatGPT",
+        "nl": "Uw gesprekken met ChatGPT",
+    }
     consent_tables = [
         props.PropsUIPromptConsentFormTable(
             id=f"chatgpt_conversations_{number}",
             number=number,
             title=props.Translatable(
                 {
-                    "en": f"Your ChatGPT conversations ({number}/{table_count})",
-                    "de": f"Ihre ChatGPT-Unterhaltungen ({number}/{table_count})",
-                    "nl": f"Uw ChatGPT-gesprekken ({number}/{table_count})",
+                    locale: title if table_count == 1 else f"{title} ({number}/{table_count})"
+                    for locale, title in titles.items()
                 }
             ),
             description=props.Translatable(
