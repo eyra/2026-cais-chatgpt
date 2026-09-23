@@ -9,6 +9,12 @@
 * Removed - This notes any features that have been deleted and removed from the software
 * Security - This acts as an invitation to users who want to upgrade and avoid any software vulnerabilities
 
+## Unreleased — CAIS ChatGPT
+
+* Changed extraction to follow the pinned Utrecht `port-chatgpt-uu` reference, restoring recursive field matching, nested message-part conversion, exact hidden-flag handling, and local-time timestamp formatting.
+* Separated reference extraction from CAIS validation, twelve-month selection, sorting, and lossless table partitioning.
+* Added reference-output regression cases cross-checked against the original extractor in UTC and Europe/Amsterdam.
+
 ## \#8 2026-07-03
 
 * Added SafeData for crash-resistant JSON access in donation scripts

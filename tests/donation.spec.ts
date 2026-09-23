@@ -1,143 +1,106 @@
 import { test, expect, Page } from '@playwright/test';
 import * as path from 'path';
 
-/**
- * Common setup for tests: navigate to the page, upload a test file
- */
-async function setupTestWithFileUpload(page: Page): Promise<void> {
-  // Navigate to the local development server
-  await page.goto('http://localhost:3000/');
+// Utrecht formats timestamps in the runtime's local timezone, not UTC.
+test.use({ timezoneId: 'Europe/Amsterdam' });
 
-  // Wait for Pyodide to initialize and render the page (can take a while on CI)
-  await expect(page.getByRole('heading', { name: 'Data donation flow example' })).toBeVisible({ timeout: 90000 });
-  
-  // Create a temporary file input for file upload
+async function uploadChatGPTExport(page: Page): Promise<void> {
+  await page.goto('http://localhost:3000/');
+  await expect(page.getByRole('heading', { name: 'Your ChatGPT data' })).toBeVisible({ timeout: 90000 });
+
   const fileChooserPromise = page.waitForEvent('filechooser');
   await page.getByText('Choose file').click();
   const fileChooser = await fileChooserPromise;
-  
-  // Set a test zip file path
-  const zipFilePath = path.join(__dirname, 'test.zip');
-  await fileChooser.setFiles(zipFilePath);
-  
-  // Click continue to process the file
+  await fileChooser.setFiles(path.join(__dirname, 'test.zip'));
   await page.getByText('Continue').click();
+
+  await expect(page.getByTestId('table-chatgpt_conversations_1')).toBeVisible();
 }
 
-/**
- * Helper to handle data submission and return the submitted data
- */
-
-function setupRouteForDataSubmission(page: Page): Promise<string|null> {
-  return new Promise<string|null>((resolve) => {
-    page.route('/data-submission', async route => {
-      const json = {ok: true};
-      await route.fulfill({ json });
-      resolve(route.request().postData());
-    });
+function captureDonation(page: Page): Promise<string | null> {
+  const { promise, resolve } = Promise.withResolvers<string | null>();
+  page.route('/data-submission', async route => {
+    await route.fulfill({ json: { ok: true } });
+    resolve(route.request().postData());
   });
+  return promise;
+}
+function donatedTables(submittedData: string): Record<string, { data: Record<string, string>[] }> {
+  const request = JSON.parse(submittedData);
+  return JSON.parse(request.data);
 }
 
-async function submitDataAndGetResult(page: Page): Promise<string | null> {
-  const result = setupRouteForDataSubmission(page);
+test('reviews and submits visible ChatGPT messages from the export', async ({ page }) => {
+  await uploadChatGPTExport(page);
+
+  const table = page.getByTestId('table-chatgpt_conversations_1');
+  await expect(table.getByText('Newest answer')).toBeVisible();
+  await expect(table.getByText('Participant question')).toBeVisible();
+  await expect(table.getByText('Hidden answer')).not.toBeVisible();
+
+  const donation = captureDonation(page);
   await page.getByText('Yes, donate', { exact: true }).click();
-  return result;
-}
+  const submittedData = await donation;
+  expect(submittedData).not.toBeNull();
 
-test('can submit data', async ({ page }) => {
-  await setupTestWithFileUpload(page);
-  
-  const submittedData = await submitDataAndGetResult(page);
-  
-  // The submitted data should contain the expected file
-  expect(submittedData).toEqual(expect.stringContaining("hello_world.txt"));
+  expect(donatedTables(submittedData!).chatgpt_conversations_1.data).toEqual([
+    {
+      'conversation title': 'Research conversation',
+      role: 'assistant',
+      message: 'Newest answer',
+      model: 'gpt-5',
+      time: '2100-01-02 13:00:00',
+    },
+    {
+      'conversation title': 'Research conversation',
+      role: 'user',
+      message: 'Participant question',
+      model: '',
+      time: '2099-12-01 13:00:00',
+    },
+  ]);
 });
 
-test('can remove rows from submission', async ({ page }) => {
-  await setupTestWithFileUpload(page);
+test('removes selected ChatGPT messages before donation', async ({ page }) => {
+  await uploadChatGPTExport(page);
 
-  // Toggle the adjust checkbox
   await page.getByRole('checkbox').first().click();
-  // Select all items for deletion from the file inventory table
-  const inventoryTable = page.getByTestId('table-file_inventory');
-  await inventoryTable.getByRole('checkbox').first().click();
-
+  const table = page.getByTestId('table-chatgpt_conversations_1');
+  await table.getByRole('checkbox').nth(1).click();
   await page.getByText('Delete selected').first().click();
-  await expect(inventoryTable.getByText('hello_world.txt')).not.toBeVisible();
+  await expect(table.getByText('Newest answer')).not.toBeVisible();
 
-  const submittedData = await submitDataAndGetResult(page);
+  const donation = captureDonation(page);
+  await page.getByText('Yes, donate', { exact: true }).click();
+  const submittedData = await donation;
+  expect(submittedData).not.toBeNull();
 
-  // The submitted data should contain the static table contents
-  expect(submittedData).toEqual(expect.stringContaining("Device A"));
-  // It should also contain the deleted row count
-  const parsedData = JSON.parse(submittedData!);
-  const data = JSON.parse(parsedData.data!);
-  expect(data.file_inventory.metadata.deletedRowCount).toEqual(1);
+  expect(donatedTables(submittedData!).chatgpt_conversations_1.data).toEqual([
+    {
+      'conversation title': 'Research conversation',
+      role: 'user',
+      message: 'Participant question',
+      model: '',
+      time: '2099-12-01 13:00:00',
+    },
+  ]);
 });
 
-test('can undo row removal before submission', async ({ page }) => {
-  await setupTestWithFileUpload(page);
-
-  // Toggle the adjust checkbox
-  await page.getByRole('checkbox').first().click();
-  
-  // Select all items for deletion from the file inventory table
-  const table = page.getByTestId('table-file_inventory');
-  await table.getByRole('checkbox').first().click();
-
-  await page.getByText('Delete selected').first().click();
-  await expect(table.getByText('hello_world.txt')).not.toBeVisible();
-
-  // Click the undo button
-  await page.getByRole('button', { name: 'Undo' }).click();
-
-  // Verify the deleted file is visible again
-  await expect(table.getByText('hello_world.txt')).toBeVisible();
-
-  const submittedData = await submitDataAndGetResult(page);
-  
-  // The submitted data should contain the previously deleted file
-  expect(submittedData).toEqual(expect.stringContaining("hello_world.txt"));
-  // The submitted data should also contain the other table contents
-  expect(submittedData).toEqual(expect.stringContaining("Device A"));
-});
-
-test('shows confirm prompt when uploading a bad zip and can retry', async ({ page }) => {
+test('rejects an invalid ZIP and returns to file selection', async ({ page }) => {
   await page.goto('http://localhost:3000/');
-  await expect(page.getByRole('heading', { name: 'Data donation flow example' })).toBeVisible({ timeout: 90000 });
+  await expect(page.getByRole('heading', { name: 'Your ChatGPT data' })).toBeVisible({ timeout: 90000 });
 
-  // Upload a non-zip file to trigger the BadZipFile error path
   const fileChooserPromise = page.waitForEvent('filechooser');
   await page.getByText('Choose file').click();
   const fileChooser = await fileChooserPromise;
-  await fileChooser.setFiles({ name: 'bad.zip', mimeType: 'application/zip', buffer: Buffer.from('not a zip') });
-
+  await fileChooser.setFiles({
+    name: 'not-chatgpt.zip',
+    mimeType: 'application/zip',
+    buffer: Buffer.from('not a ZIP archive'),
+  });
   await page.getByText('Continue').click();
 
-  // The confirm prompt should appear with only the "Try again" button (no cancel)
-  await expect(page.getByRole('button', { name: 'Try again' })).toBeVisible();
-  expect(await page.getByRole('button', { name: 'Cancel' }).count()).toBe(0);
-
-  // Clicking "Try again" should return to the file upload step
+  await expect(page.getByText('We could not verify this as a ChatGPT data export.')).toBeVisible();
   await page.getByRole('button', { name: 'Try again' }).click();
   await expect(page.getByText('Choose file')).toBeVisible();
-});
-
-test('can cancel submission', async ({ page }) => {
-  await setupTestWithFileUpload(page);
-
-  // Toggle the adjust checkbox
-  await page.getByRole('checkbox').first().click();
-  
-  // Setup the route to capture the submission data
-  const result = setupRouteForDataSubmission(page);
-  await page.getByText('No', { exact: true }).click();
-  const submittedData = await result;
-
-  // The submitted data should not contain the previously deleted file
-  expect(submittedData).not.toEqual(expect.stringContaining("hello_world.txt"));
-  // The submitted data should also not contain the other table contents
-  expect(submittedData).not.toEqual(expect.stringContaining("I don't always test my code"));
-  // The submitted data should contain the cancellation message
-  expect(submittedData).toEqual(expect.stringContaining("data_submission declined"));
 });

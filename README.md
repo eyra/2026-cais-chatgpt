@@ -45,11 +45,43 @@ Feldspar enables researchers to:
 
 The core of Feldspar's functionality is in the Python script at `packages/python/port/script.py`. This script defines the flow of the data donation process.
 
+### CAIS replication and reference provenance
+
+This study uses [trbKnl/port-chatgpt-uu at commit
+`d80e9d834095034c9e80c85986bdab61fb8f152a`](https://github.com/trbKnl/port-chatgpt-uu/tree/d80e9d834095034c9e80c85986bdab61fb8f152a)
+as its extraction reference (AGPL-3.0).
+
+- `packages/python/port/helpers.py` retains the reference's recursive flattening,
+  substring matching, shallowest-match precedence, insertion-order ties, scalar
+  string conversion, and local-time timestamp formatting.
+- `packages/python/port/chatgpt.py` follows the reference extraction loop and five
+  fields: `conversation title`, `role`, `message`, `model`, `time`. It visits all
+  mapping branches, excludes only hidden values matching the string `"True"`,
+  and keeps every nonempty extracted role, rather than adding a user/assistant
+  whitelist. Input is parsed JSON rather than a ZIP path.
+- `packages/python/port/script.py` implements only the CAIS flow around that
+  extraction: structural validation, a twelve-calendar-month UTC cutoff,
+  stable newest-first ordering, and lossless table partitioning. Filtering uses
+  the same raw timestamp selected by the reference, not the formatted local
+  time. Missing, unparseable, or nonfinite timestamps cannot be placed within
+  that window and are excluded; the raw reference extractor still retains them.
+
+Two private fields (`_conversation` and `_create_time`) support that processing
+and are never donated. Empty exports retain the five-column schema. Malformed
+conversation structures are rejected instead of returning a misleading empty
+success result as the original's broad exception handler could.
+
+Compatibility cases in `packages/python/tests/test_chatgpt_reference.py` were
+cross-checked against the unmodified pinned extractor in UTC and Europe/Amsterdam.
+They cover nested content, alternate branches, field precedence, hidden flags,
+duplicate titles, and missing timestamps. These are synthetic fixtures, not a
+claim of verification against the access-restricted CAIS example exports.
+
 ### Basic Structure
 
 1. Fork the repository to create your own version
 2. Navigate to `packages/python/port/script.py`
-3. Modify the `process(sessionId)` function to customize your data donation flow
+3. Modify the `process(data)` function to customize your data donation flow
 
 A basic donation flow typically includes:
 
@@ -96,7 +128,12 @@ Row limits for data frames in the Props UI:
 - Consent Table: default maximum of 10,000 rows (configurable)
 - UI hard cap: 50,000 rows (cannot be exceeded)
 
-For larger datasets, pre-aggregate or sample before display, and review your informed consent and privacy guidelines.
+For CAIS, do not sample or truncate. `TABLE_ROW_LIMIT` in `port/script.py` sets the
+maximum rows per table (10,000 by default, configurable up to 50,000). Split the
+sorted messages before constructing consent-table props. Preserve contiguous
+conversation boundaries where possible; split oversized conversations without
+changing message order or losing rows. Interleaved conversations may still span
+tables because global newest-first ordering takes precedence.
 
 ### Local extraction debugging (CLI)
 
@@ -107,7 +144,7 @@ cd packages/python
 poetry run python -m port.script path/to/file.zip
 ```
 
-This drives `extract_data()` directly and prints each extracted table to the terminal. Useful for quickly verifying that your extraction logic works before testing it in the browser.
+This drives `extract_tables()` and prints the resulting tables for a valid export.
 
 ### Adding Dependencies
 

@@ -1,407 +1,293 @@
-# --------------------------------------------------------------------
-# Note to developers:
-#
-# This script (`script.py`) provides a basic data donation flow using
-# standard UI components available in Feldspar.
-#
-# It demonstrates:
-#   - File upload and validation
-#   - Multiple named extraction steps with yield FlushLogs between them
-#     so log messages reach the client in real time during long extractions
-#   - Multiple result tables shown in the consent form
-#
-# For a more advanced example that includes custom UI components
-# (e.g. a custom React-based component integrated with Python),
-# please refer to:
-#
-#     `script_custom_ui.py`
-#
-# That script demonstrates how to define and use your own components
-# using Feldspar's React integration and how to render them via Python.
-# --------------------------------------------------------------------
+"""CAIS ChatGPT data-donation flow.
+
+The Utrecht extraction lives in port.chatgpt and port.helpers. This module
+adds the CAIS upload validation, twelve-month filter, sorting and lossless
+table partitioning using the current Feldspar file and consent APIs.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Generator
+from datetime import datetime, timezone
+from pathlib import PurePosixPath
+import json
+import logging
+from typing import Any
+import zipfile
+
+import pandas as pd
 
 import port.api.props as props
-from port.api.assets import *
-from port.api.commands import CommandSystemDonate, CommandSystemExit, CommandUIRender, FlushLogs
-from port.safe_data import SafeData
-
-import logging
-import os
-import pandas as pd
-import zipfile
-import json
-import time
-from collections import namedtuple
+from port import chatgpt
+from port.api.commands import CommandSystemDonate, CommandUIRender, FlushLogs
+from port.chatgpt import MESSAGE_COLUMNS
 
 logger = logging.getLogger(__name__)
 
-ExtractionResult = namedtuple("ExtractionResult", ["name", "data_frame"])
+CHATGPT_EXPORT_FILE = "conversations.json"
+MIN_TABLE_ROW_LIMIT = 10_000
+MAX_TABLE_ROW_LIMIT = 50_000
+TABLE_ROW_LIMIT = 10_000
 
 
-######################
-# Data donation flow #
-######################
+class InvalidChatGPTExport(ValueError):
+    """Raised when an upload is not a structurally valid ChatGPT export."""
 
-def process(data):
-    # `data` is a context dict routed from the JS framework:
-    #   {"sessionId": "...", "locale": "en" | "nl" | ...}
-    # Use `locale` for strings rendered into DataFrame cells (column headers,
-    # summary descriptions) — those bypass the React i18n layer.
-    sessionId = data.get("sessionId")
-    locale = data.get("locale", "en")
-    logger.info(f"user entered script (locale={locale})")
-    key = "zip-contents-example"
 
-    results = None
+def process(data: dict[str, str]) -> Generator:
+    session_id = data.get("sessionId", "")
+    tables: list[pd.DataFrame] | None = None
 
     while True:
-        fileResult = yield from step_1_select_file(key)
-        if fileResult is None:
-            break
+        file_result = yield render_data_submission_page([prompt_file()])
+        if file_result.__type__ != "PayloadFile":
+            return
 
-        results, retry = yield from step_2_extract_data_from_file(key, fileResult, locale)
+        tables, retry = yield from extract_tables(file_result.value)
         if retry:
             continue
         break
 
-    if results:
-        yield from step_3_consent(key, sessionId, results)
+    if tables is None:
+        return
+
+    result = yield render_data_submission_page(prompt_consent(tables))
+    if result.__type__ == "PayloadJSON":
+        yield donate(f"{session_id}-chatgpt-conversations", result.value)
+    elif result.__type__ == "PayloadFalse":
+        yield donate(
+            f"{session_id}-chatgpt-conversations",
+            json.dumps({"status": "data_submission declined"}),
+        )
 
 
-def step_1_select_file(key):
-    logger.debug(f"{key}: prompt file")
-    fileResult = yield render_data_submission_page([prompt_file("application/zip, text/plain")])
-    if fileResult.__type__ != "PayloadFile":
-        logger.debug(f"{key}: no file selected, exit")
-        return None
-    return fileResult
-
-
-def step_2_extract_data_from_file(key, fileResult, locale="en"):
-    logger.debug(f"{key}: extracting file")
-    results = None
+def extract_tables(
+    path: Any, now: datetime | None = None
+) -> Generator[object, None, tuple[list[pd.DataFrame] | None, bool]]:
     try:
-        results = yield from extract_data(fileResult.value, locale)
-    except (IOError, zipfile.BadZipFile):
-        logger.debug(f"{key}: prompt confirmation to retry file selection")
-        retry_result = yield render_data_submission_page(retry_confirmation())
-        if retry_result.__type__ == "PayloadTrue":
-            return None, True
-        logger.debug(f"{key}: user declined retry, exit")
-        return None, False
-    logger.debug(f"{key}: extraction successful, go to consent form")
-    return results, False
+        conversations = load_conversations(path)
+        frame = conversations_to_dataframe(conversations, now=now)
+        tables = partition_dataframe(frame)
+        logger.info(
+            "Extracted %s ChatGPT messages into %s review table(s)",
+            len(frame),
+            len(tables),
+        )
+        yield FlushLogs
+        return tables, False
+    except InvalidChatGPTExport as error:
+        logger.info("Rejected ChatGPT export: %s", error)
+        retry_result = yield render_data_submission_page([retry_confirmation()])
+        return None, retry_result.__type__ == "PayloadTrue"
 
 
-def step_3_consent(key, sessionId, results):
-    logger.debug(f"{key}: prompt consent")
-    for prompt in prompt_consent(results):
-        result = yield prompt
-        if result.__type__ == "PayloadJSON":
-            logger.debug(f"{key}: donate consent data")
-            yield donate(f"{sessionId}-{key}", result.value)
-        if result.__type__ == "PayloadFalse":
-            value = json.dumps('{"status" : "data_submission declined"}')
-            yield donate(f"{sessionId}-{key}", value)
+def load_conversations(path: Any) -> list[dict[str, Any]]:
+    """Read and structurally validate the archive's conversations payload."""
+    try:
+        with zipfile.ZipFile(path) as archive:
+            candidates = [
+                info
+                for info in archive.infolist()
+                if not info.is_dir()
+                and PurePosixPath(info.filename).name == CHATGPT_EXPORT_FILE
+            ]
+            if len(candidates) != 1:
+                raise InvalidChatGPTExport(
+                    f"expected one {CHATGPT_EXPORT_FILE}, found {len(candidates)}"
+                )
+
+            with archive.open(candidates[0]) as source:
+                conversations = json.load(source)
+    except InvalidChatGPTExport:
+        raise
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, zipfile.BadZipFile) as error:
+        raise InvalidChatGPTExport("archive or conversations JSON cannot be read") from error
+
+    if not isinstance(conversations, list):
+        raise InvalidChatGPTExport("conversations JSON must contain a list")
+    if not all(
+        isinstance(conversation, dict)
+        and "title" in conversation
+        and isinstance(conversation.get("mapping"), dict)
+        for conversation in conversations
+    ):
+        raise InvalidChatGPTExport("every conversation must have a title and mapping")
+
+    return conversations
 
 
-##########################
-# Zip file processing    #
-##########################
+def conversations_to_dataframe(
+    conversations: list[dict[str, Any]], now: datetime | None = None
+) -> pd.DataFrame:
+    """Apply CAIS time selection/order without changing the Utrecht field values.
 
-def extract_data(path, locale="en"):
-    """Generator that runs extraction steps, returning the results list.
-
-    Yields FlushLogs between steps so progress logs reach the client in real
-    time rather than all at once when the consent page renders. Call via:
-
-        results = yield from extract_data(path, locale)
+    The cutoff uses absolute UTC time, not the reference's local display string.
+    Undated/unparseable messages cannot be assigned to the study window and are
+    excluded here, not by the reference extractor.
     """
-    logger.info("extract_data: opening zip file")
-    zf = zipfile.ZipFile(path)
-    logger.info(f"extract_data: zip opened, {len(zf.namelist())} files")
-    results = []
-
-    extractors = [
-        ("file inventory", lambda: extract_file_inventory(zf, locale)),
-        ("file types",     lambda: extract_file_types(zf)),
-        ("largest files",  lambda: extract_largest_files(zf)),
-        ("json summary",   lambda: extract_json_summary(zf)),
-    ]
-
-    for name, fn in extractors:
-        logger.debug(f"extract_data: extracting {name}...")
-        try:
-            results.append(fn())
-            logger.info(f"extract_data: {name} extracted successfully")
-            yield FlushLogs  # stream progress logs to the client in real time between extractors
-        except Exception as e:
-            logger.error(f"extract_data: failed to extract {name}: {e}", exc_info=True)
-            raise
-
-    logger.info(f"extract_data: done, {len(results)} tables extracted")
-    return results
+    current_time = normalise_utc(now or datetime.now(timezone.utc))
+    cutoff = twelve_month_cutoff(current_time).timestamp()
+    frame = chatgpt.conversations_to_df(conversations)
+    timestamps = pd.to_numeric(frame["_create_time"], errors="coerce")
+    in_window = timestamps.ge(cutoff) & timestamps.lt(float("inf"))
+    ordered_index = timestamps[in_window].sort_values(
+        ascending=False, kind="stable"
+    ).index
+    return frame.loc[ordered_index, [*MESSAGE_COLUMNS, "_conversation"]].reset_index(drop=True)
 
 
-FILE_INVENTORY_HEADERS = {
-    "en": ["Filename", "Compressed size", "Size"],
-    "de": ["Dateiname", "Komprimierte Größe", "Größe"],
-    "it": ["Nome file", "Dimensione compressa", "Dimensione"],
-    "es": ["Nombre de archivo", "Tamaño comprimido", "Tamaño"],
-    "nl": ["Bestandsnaam", "Gecomprimeerde grootte", "Grootte"],
-    "ro": ["Nume fișier", "Dimensiune comprimată", "Dimensiune"],
-    "lt": ["Failo pavadinimas", "Suspaustas dydis", "Dydis"],
-}
+def partition_dataframe(
+    frame: pd.DataFrame, row_limit: int = TABLE_ROW_LIMIT
+) -> list[pd.DataFrame]:
+    """Split a sorted frame without truncation, respecting contiguous conversations."""
+    validate_table_row_limit(row_limit)
+    if frame.empty:
+        return [pd.DataFrame(columns=MESSAGE_COLUMNS)]
+
+    tables: list[pd.DataFrame] = []
+    start = 0
+    total_rows = len(frame)
+    while start < total_rows:
+        end = min(start + row_limit, total_rows)
+        if end < total_rows and frame.iloc[end - 1]["_conversation"] == frame.iloc[end]["_conversation"]:
+            boundary = end
+            while boundary > start and frame.iloc[boundary - 1]["_conversation"] == frame.iloc[end]["_conversation"]:
+                boundary -= 1
+            if boundary > start:
+                end = boundary
+
+        tables.append(frame.iloc[start:end][MESSAGE_COLUMNS].reset_index(drop=True))
+        start = end
+
+    return tables
 
 
-def extract_file_inventory(zf, locale="en"):
-    """List every file in the zip with its compressed and uncompressed size.
-
-    Column headers are localized via `locale` — this demonstrates threading the
-    UI locale into DataFrame content, which bypasses the React i18n layer.
-    """
-    headers = FILE_INVENTORY_HEADERS.get(locale, FILE_INVENTORY_HEADERS["en"])
-    filename_col, compressed_col, size_col = headers
-    rows = []
-    for info in zf.infolist():
-        time.sleep(0.01)  # artificial delay — remove in production
-        rows.append({
-            filename_col: info.filename,
-            compressed_col: info.compress_size,
-            size_col: info.file_size,
-        })
-    return ExtractionResult("file_inventory", pd.DataFrame(rows, columns=headers))
+def validate_table_row_limit(row_limit: int) -> None:
+    if not MIN_TABLE_ROW_LIMIT <= row_limit <= MAX_TABLE_ROW_LIMIT:
+        raise ValueError(
+            f"table row limit must be between {MIN_TABLE_ROW_LIMIT} and {MAX_TABLE_ROW_LIMIT}"
+        )
 
 
-def extract_file_types(zf):
-    """Count files grouped by extension."""
-    from collections import Counter
-    extensions = Counter(
-        os.path.splitext(name)[1].lower() or "(none)"
-        for name in zf.namelist()
-    )
-    rows = [{"Extension": ext, "Count": count} for ext, count in sorted(extensions.items())]
-    return ExtractionResult("file_types", pd.DataFrame(rows, columns=["Extension", "Count"]))
+def normalise_utc(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
 
 
-def extract_largest_files(zf, n=10):
-    """Show the top N files by uncompressed size."""
-    files = sorted(zf.infolist(), key=lambda i: i.file_size, reverse=True)[:n]
-    rows = [{"Filename": i.filename, "Size": i.file_size} for i in files]
-    return ExtractionResult("largest_files", pd.DataFrame(rows, columns=["Filename", "Size"]))
+def twelve_month_cutoff(value: datetime) -> datetime:
+    try:
+        return value.replace(year=value.year - 1)
+    except ValueError:  # 29 February to a non-leap year
+        return value.replace(year=value.year - 1, day=28)
 
 
-def extract_json_summary(zf):
-    """Summarise every .json file in the zip using SafeData.
-
-    Demonstrates SafeData usage: each JSON file is parsed with
-    `SafeData.parse_json`, fields are pulled with typed getters that
-    return safe defaults on missing/wrong-type, dotted paths walk into
-    nested objects, and `had_errors()` flags whether the file's data
-    was fully clean.
-
-    The fields below are illustrative — typical donation-data shapes
-    have things like a user profile, an items list, and timestamps.
-    None of the accessors will raise if a field is missing or has an
-    unexpected type; instead the default is used and the error is
-    logged.
-    """
-    rows = []
-    for name in zf.namelist():
-        if not name.lower().endswith(".json"):
-            continue
-        with zf.open(name) as f:
-            data = SafeData.parse_json(f)
-        items = data.get_list_of(SafeData, "items")
-        rows.append({
-            "Filename": name,
-            # The same field may appear under different keys/shapes across
-            # export versions — list the candidates and take the first match.
-            "User": data.get_str("user.name", "user.displayName", "account.fullName", default="(unknown)"),
-            "User ID": data.get_int("user.id", "user.userId", default=0),
-            "Item count": len(items),
-            "Errors": "yes" if data.had_errors() else "no",
-        })
-    return ExtractionResult(
-        "json_summary",
-        pd.DataFrame(rows, columns=["Filename", "User", "User ID", "Item count", "Errors"]),
-    )
 
 
-######################
-# UI helpers         #
-######################
-
-def render_data_submission_page(body):
+def render_data_submission_page(body: list[Any]) -> CommandUIRender:
     header = props.PropsUIHeader(
         props.Translatable(
             {
-                "en": "Data donation flow example",
-                "de": "Beispiel für einen Datenspende-Ablauf",
-                "it": "Esempio di flusso di donazione dei dati",
-                "es": "Ejemplo de flujo de donación de datos",
-                "nl": "Voorbeeld van een datadonatieproces",
-                "ro": "Exemplu de flux de donație a datelor",
-                "lt": "Duomenų dovanojimo srauto pavyzdys",
+                "en": "Your ChatGPT data",
+                "de": "Ihre ChatGPT-Daten",
+                "nl": "Uw ChatGPT-gegevens",
             }
         )
     )
-    body_items = [body] if not isinstance(body, list) else body
-    page = props.PropsUIPageDataSubmission("Zip", header, body_items)
-    return CommandUIRender(page)
+    return CommandUIRender(props.PropsUIPageDataSubmission("ChatGPT", header, body))
 
 
-def retry_confirmation():
-    text = props.Translatable(
-        {
-            "en": "Unfortunately, we cannot process your file. Continue, if you are sure that you selected the right file. Try again to select a different file.",
-            "de": "Leider können wir Ihre Datei nicht bearbeiten. Fahren Sie fort, wenn Sie sicher sind, dass Sie die richtige Datei ausgewählt haben. Versuchen Sie, eine andere Datei auszuwählen.",
-            "it": "Purtroppo non possiamo elaborare il tuo file. Continua se sei sicuro di aver selezionato il file corretto. Prova a selezionare un file diverso.",
-            "es": "Lamentablemente, no podemos procesar su archivo. Continúe si está seguro de que ha seleccionado el archivo correcto. Intente seleccionar un archivo diferente.",
-            "nl": "Helaas, kunnen we uw bestand niet verwerken. Weet u zeker dat u het juiste bestand heeft gekozen? Ga dan verder. Probeer opnieuw als u een ander bestand wilt kiezen.",
-            "ro": "Din păcate, nu putem procesa fișierul dvs. Continuați dacă sunteți sigur că ați selectat fișierul corect. Încercați din nou pentru a selecta un fișier diferit.",
-            "lt": "Deja, negalime apdoroti jūsų failo. Tęskite, jei esate tikri, kad pasirinkote tinkamą failą. Bandykite dar kartą pasirinkti kitą failą.",
-        }
-    )
-    ok = props.Translatable(
-        {
-            "en": "Try again",
-            "de": "Erneut versuchen",
-            "it": "Riprova",
-            "es": "Inténtelo de nuevo",
-            "nl": "Probeer opnieuw",
-            "ro": "Încercați din nou",
-            "lt": "Bandykite dar kartą",
-        }
-    )
-    return props.PropsUIPromptConfirm(text, ok)
-
-
-def prompt_file(extensions):
-    description = props.Translatable(
-        {
-            "en": "Please select a zip file stored on your device.",
-            "de": "Bitte wählen Sie eine ZIP-Datei auf Ihrem Gerät aus.",
-            "it": "Seleziona un file ZIP memorizzato sul tuo dispositivo.",
-            "es": "Por favor, seleccione un archivo ZIP guardado en su dispositivo.",
-            "nl": "Selecteer een ZIP-bestand dat op uw apparaat is opgeslagen.",
-            "ro": "Vă rugăm să selectați un fișier ZIP stocat pe dispozitivul dvs.",
-            "lt": "Prašome pasirinkti ZIP failą, saugomą jūsų įrenginyje.",
-        }
-    )
-    return props.PropsUIPromptFileInput(description, extensions)
-
-
-def prompt_consent(data):
-    """data is a list of ExtractionResult namedtuples from extract_data."""
-    description = props.PropsUIPromptText(
-        text=props.Translatable(
+def prompt_file() -> props.PropsUIPromptFileInput:
+    return props.PropsUIPromptFileInput(
+        props.Translatable(
             {
-                "en": "Please review the data below. You can remove any information you prefer not to share. Thank you for supporting this research project!",
-                "de": "Bitte überprüfen Sie Ihre Daten unten. Sie können alle Daten entfernen, die Sie nicht teilen möchten. Vielen Dank für Ihre Unterstützung dieses Forschungsprojekts!",
-                "it": "Controlla i tuoi dati qui sotto. Puoi rimuovere qualsiasi dato che preferisci non condividere. Grazie per il tuo supporto a questo progetto di ricerca!",
-                "es": "Revise sus datos a continuación. Puede eliminar cualquier dato que prefiera no compartir. ¡Gracias por apoyar este proyecto de investigación!",
-                "nl": "Bekijk hieronder uw gegevens. U kunt gegevens verwijderen die u liever niet deelt. Bedankt voor uw steun aan dit onderzoeksproject!",
-                "ro": "Vă rugăm să revizuiți datele de mai jos. Puteți elimina orice date pe care preferați să nu le partajați. Vă mulțumim că sprijiniți acest proiect de cercetare!",
-                "lt": "Prašome peržiūrėti savo duomenis žemiau. Galite pašalinti bet kokius duomenis, kurių nenorite bendrinti. Ačiū, kad remiate šį tyrimų projektą!",
+                "en": "Please select the ZIP file from your ChatGPT data export.",
+                "de": "Bitte wählen Sie die ZIP-Datei aus Ihrem ChatGPT-Datenexport.",
+                "nl": "Selecteer het ZIP-bestand uit uw ChatGPT-data-export.",
             }
-        )
+        ),
+        "application/zip,.zip",
     )
 
-    # Tables derived from the uploaded zip file
-    tables = [
+
+def retry_confirmation() -> props.PropsUIPromptConfirm:
+    return props.PropsUIPromptConfirm(
+        props.Translatable(
+            {
+                "en": "We could not verify this as a ChatGPT data export. Please select a different ZIP file.",
+                "de": "Diese Datei konnte nicht als ChatGPT-Datenexport bestätigt werden. Bitte wählen Sie eine andere ZIP-Datei.",
+                "nl": "We konden dit bestand niet verifiëren als een ChatGPT-data-export. Selecteer een ander ZIP-bestand.",
+            }
+        ),
+        props.Translatable({"en": "Try again", "de": "Erneut versuchen", "nl": "Probeer opnieuw"}),
+    )
+
+
+def prompt_consent(tables: list[pd.DataFrame]) -> list[Any]:
+    table_count = len(tables)
+    consent_tables = [
         props.PropsUIPromptConsentFormTable(
-            result.name,
-            i,
-            props.Translatable({"en": result.name.replace("_", " ").title(), "nl": result.name.replace("_", " ").title()}),
-            props.Translatable({"en": f"Overview of {result.name.replace('_', ' ')} from your zip file."}),
-            result.data_frame,
+            id=f"chatgpt_conversations_{number}",
+            number=number,
+            title=props.Translatable(
+                {
+                    "en": f"Your ChatGPT conversations ({number}/{table_count})",
+                    "de": f"Ihre ChatGPT-Unterhaltungen ({number}/{table_count})",
+                    "nl": f"Uw ChatGPT-gesprekken ({number}/{table_count})",
+                }
+            ),
+            description=props.Translatable(
+                {
+                    "en": "Messages from the last 12 months, newest first.",
+                    "de": "Nachrichten der letzten 12 Monate, neueste zuerst.",
+                    "nl": "Berichten van de afgelopen 12 maanden, nieuwste eerst.",
+                }
+            ),
+            data_frame=table,
+            data_frame_max_size=TABLE_ROW_LIMIT,
         )
-        for i, result in enumerate(data, start=1)
+        for number, table in enumerate(tables, start=1)
+    ]
+    return [
+        props.PropsUIPromptText(
+            props.Translatable(
+                {
+                    "en": "Please review the ChatGPT messages below. You can remove any information you prefer not to share.",
+                    "de": "Bitte überprüfen Sie die untenstehenden ChatGPT-Nachrichten. Sie können alle Informationen entfernen, die Sie nicht teilen möchten.",
+                    "nl": "Bekijk hieronder uw ChatGPT-berichten. U kunt informatie verwijderen die u liever niet deelt.",
+                }
+            )
+        ),
+        *consent_tables,
+        props.PropsUIDataSubmissionButtons(
+            donate_question=props.Translatable(
+                {
+                    "en": "Would you like to donate the above data?",
+                    "de": "Möchten Sie die obenstehenden Daten spenden?",
+                    "nl": "Wilt u de bovenstaande gegevens doneren?",
+                }
+            ),
+            donate_button=props.Translatable(
+                {"en": "Yes, donate", "de": "Ja, spenden", "nl": "Ja, doneer"}
+            ),
+        ),
     ]
 
-    # Example of a static table with hardcoded data — useful for reference data
-    # or metadata that does not come from the uploaded file.
-    static_table = props.PropsUIPromptConsentFormTable(
-        "zip_content",
-        len(data) + 1,
-        props.Translatable(
-            {
-                "en": "Example Metadata Table",
-                "de": "Beispieltabelle für Metadaten",
-                "it": "Tabella di metadati di esempio",
-                "es": "Tabla de metadatos de ejemplo",
-                "nl": "Voorbeeld van metagegevens tabel",
-                "ro": "Tabel de metadate de exemplu",
-                "lt": "Metaduomenų lentelės pavyzdys",
-            }
-        ),
-        props.Translatable(
-            {
-                "en": "This table is static — its content is hardcoded, not derived from the uploaded file. Use this pattern for reference data or study metadata.",
-            }
-        ),
-        pd.DataFrame(
-            [
-                ["participant-001", "Device A", "2025-06-01"],
-                ["participant-002", "Device B", "2025-06-02"],
-                ["participant-003", "Device C", "2025-06-03"],
-            ],
-            columns=["Participant ID", "Device", "Date"],
-        ),
-        data_frame_max_size=5000,
-    )
 
-    result = yield render_data_submission_page(
-        [description]
-        + tables
-        + [static_table]
-        + [
-            props.PropsUIDataSubmissionButtons(
-                donate_question=props.Translatable(
-                    {
-                        "en": "Would you like to donate the above data?",
-                        "de": "Möchten Sie die obenstehenden Daten spenden?",
-                        "it": "Vuoi donare i dati sopra indicati?",
-                        "es": "¿Le gustaría donar los datos anteriores?",
-                        "nl": "Wilt u de bovenstaande gegevens doneren?",
-                        "ro": "Doriți să donați datele de mai sus?",
-                        "lt": "Ar norėtumėte paaukoti aukščiau pateiktus duomenis?",
-                    }
-                ),
-                donate_button=props.Translatable(
-                    {
-                        "en": "Yes, donate",
-                        "de": "Ja, spenden",
-                        "it": "Sì, dona",
-                        "es": "Sí, donar",
-                        "nl": "Ja, doneer",
-                        "ro": "Da, donez",
-                        "lt": "Taip, paaukokite",
-                    }
-                ),
-            ),
-        ]
-    )
-    return result
-
-
-def donate(key, json_string):
+def donate(key: str, json_string: str) -> CommandSystemDonate:
     return CommandSystemDonate(key, json_string)
-
-
-def exit(code, info):
-    return CommandSystemExit(code, info)
 
 
 if __name__ == "__main__":
     import sys
+
     if len(sys.argv) < 2:
-        print("Usage: python -m port.script path/to/file.zip")
-        sys.exit(1)
-    gen = extract_data(sys.argv[1])
+        print("Usage: python -m port.script path/to/chatgpt-export.zip")
+        raise SystemExit(1)
+
+    generator = extract_tables(sys.argv[1])
     try:
         while True:
-            next(gen)
-    except StopIteration as e:
-        print(e.value)
+            next(generator)
+    except StopIteration as result:
+        print(result.value)
