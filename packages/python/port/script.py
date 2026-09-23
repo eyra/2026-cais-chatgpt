@@ -269,9 +269,9 @@ def prompt_consent(tables: list[pd.DataFrame]) -> list[Any]:
         props.PropsUIPromptText(
             props.Translatable(
                 {
-                    "en": "Please review the ChatGPT messages below. You can remove any information you prefer not to share.",
-                    "de": "Bitte überprüfen Sie die untenstehenden ChatGPT-Nachrichten. Sie können alle Informationen entfernen, die Sie nicht teilen möchten.",
-                    "nl": "Bekijk hieronder uw ChatGPT-berichten. U kunt informatie verwijderen die u liever niet deelt.",
+                    "en": "Determine whether you would like to donate the data below. Carefully check the data and adjust when required. With your donation you contribute to the previously described research. Thank you in advance.",
+                    "de": "Entscheiden Sie, ob Sie die untenstehenden Daten spenden möchten. Prüfen Sie die Daten sorgfältig und passen Sie sie bei Bedarf an. Mit Ihrer Spende tragen Sie zu der zuvor beschriebenen Forschung bei. Vielen Dank im Voraus.",
+                    "nl": "Bepaal of u de onderstaande gegevens wilt doneren. Bekijk de gegevens zorgvuldig en pas zo nodig aan. Met uw donatie draagt u bij aan het eerder beschreven onderzoek. Alvast hartelijk dank.",
                 }
             )
         ),
