@@ -15,6 +15,13 @@
 * Separated reference extraction from CAIS validation, twelve-month selection, sorting, and lossless table partitioning.
 * Added reference-output regression cases cross-checked against the original extractor in UTC and Europe/Amsterdam.
 
+## Unreleased
+
+* Fixed - Hide framework numbering for a single consent table; number multiple tables in display order without changing script-authored titles or donated data.
+* Fixed - Bound long consent-table and mobile-card text to three-line previews with an explicit full-text reader only when lines are hidden, preserving complete search and donation values.
+* Changed - Left-align desktop table search when pagination is not needed, without showing a redundant single-page indicator.
+* Changed - Show translated field names in full-text dialog headings using Title6, with a baseline-aligned Caption label in grey2 that wraps on narrow screens; empty labels retain the "Full text" fallback.
+
 ## \#8 2026-07-03
 
 * Added SafeData for crash-resistant JSON access in donation scripts
