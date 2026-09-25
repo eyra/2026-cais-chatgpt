@@ -45,41 +45,58 @@ Feldspar enables researchers to:
 
 The core of Feldspar's functionality is in the Python script at `packages/python/port/script.py`. This script defines the flow of the data donation process.
 
-### CAIS replication and reference provenance
+### CAIS extraction and reference provenance
 
-This study uses [trbKnl/port-chatgpt-uu at commit
+The five donated fields (`conversation title`, `role`, `message`, `model`,
+`time`) and local-time `YYYY-MM-DD HH:MM:SS` formatting follow
+[trbKnl/port-chatgpt-uu at commit
 `d80e9d834095034c9e80c85986bdab61fb8f152a`](https://github.com/trbKnl/port-chatgpt-uu/tree/d80e9d834095034c9e80c85986bdab61fb8f152a)
-as its extraction reference (AGPL-3.0).
+(AGPL-3.0). Donated values mirror the reference: on four real exports
+(August 2026), every message produced the same row as the unmodified reference
+extractor. The reference's fuzzy key matching is replaced by explicit parsing
+that accepts only the observed format and reports anything else ("fail soon"):
 
-- `packages/python/port/helpers.py` retains the reference's recursive flattening,
-  substring matching, shallowest-match precedence, insertion-order ties, scalar
-  string conversion, and local-time timestamp formatting.
-- `packages/python/port/chatgpt.py` follows the reference extraction loop and five
-  fields: `conversation title`, `role`, `message`, `model`, `time`. It visits all
-  mapping branches, excludes only hidden values matching the string `"True"`,
-  and keeps every nonempty extracted role, rather than adding a user/assistant
-  whitelist. Input is parsed JSON rather than a ZIP path.
-- `packages/python/port/script.py` implements only the CAIS flow around that
-  extraction: structural validation, a twelve-calendar-month UTC cutoff,
-  stable newest-first ordering, and lossless table partitioning. Filtering uses
-  the same raw timestamp selected by the reference, not the formatted local
-  time. Missing, unparseable, or nonfinite timestamps cannot be placed within
-  that window and are excluded; the raw reference extractor still retains them.
+- `packages/python/port/chatgpt.py` reads only `title`, `message.author.role`,
+  `message.metadata.model_slug`, `message.create_time`, the hidden flag and
+  `message.content.parts`. Similarly named keys elsewhere can no longer override
+  a field or be appended to message text. Message text is retained verbatim,
+  including markdown and ChatGPT's inline citation markers.
+- As in the reference: all mapping branches (edited prompts, regenerated
+  answers) are donated; non-text parts are flattened into their scalar values
+  (e.g. image pointer and dimensions, `None` for nulls); reasoning messages
+  (`thoughts`, `reasoning_recap`) are rows with an empty message.
+- Only observed encodings are accepted: timestamps as numeric Unix seconds, the
+  hidden flag as a boolean (normally absent), titles as strings. Absent model
+  or metadata (user messages) is an empty model. Other encodings and unknown
+  content types without `parts` are reported as issues, not guessed.
+- The table shows messages from the last twelve calendar months (UTC), newest
+  first. Note: the reference kept export order (conversations in file order,
+  messages in mapping order).
+- `packages/python/port/script.py` validates the archive boundary. Current
+  exports list their files in `export_manifest.json`; large exports may split
+  `conversations.json` into several files, which are read in manifest order,
+  one at a time, so peak memory is one file rather than the whole export.
+  Exports without such a manifest must contain exactly one `conversations.json`.
+  Each file must be at most 256 MiB of readable UTF-8 JSON without duplicate
+  keys. A missing listed file or unreadable JSON rejects the export with a retry.
 
-Two private fields (`_conversation` and `_create_time`) support that processing
-and are never donated. Empty exports retain the five-column schema. Malformed
-conversation structures are rejected instead of returning a misleading empty
-success result as the original's broad exception handler could.
+Records that cannot be interpreted safely are excluded individually instead of
+failing the whole export or silently disappearing. Each exclusion is reported in
+a separate donated table, `chatgpt_processing_issues_N`, with columns
+`conversation` and `message` (1-based positions across the whole export), `reason` (a
+fixed code such as `invalid_timestamp`, `future_timestamp`, `invalid_content`,
+`invalid_mapping`) and `action` (`message_excluded` or `conversation_excluded`).
+The report never contains titles, text or export IDs; participants can review
+and remove its rows like any other table. The issues table is only present when
+issues occur, so exports without issues donate exactly the same JSON as before.
+If failures leave no usable messages, the participant is asked to retry rather
+than donating an issues-only report. Messages outside the study window are not
+issues.
 
-Message text is donated exactly as the reference extracts it. This includes
-ChatGPT's inline web-citation markers (private-use characters wrapping values such
-as `cite`, `turn0search1`), which are intentionally neither removed nor rewritten.
-
-Compatibility cases in `packages/python/tests/test_chatgpt_reference.py` were
-cross-checked against the unmodified pinned extractor in UTC and Europe/Amsterdam.
-They cover nested content, alternate branches, field precedence, hidden flags,
-duplicate titles, and missing timestamps. These are synthetic fixtures, not a
-claim of verification against the access-restricted CAIS example exports.
+Coverage is in `packages/python/tests/` and `tests/donation.spec.ts`, using
+synthetic fixtures shaped like the real exports. No split export has been
+observed yet; that support follows the manifest format and is covered by
+synthetic tests only.
 
 ### Basic Structure
 

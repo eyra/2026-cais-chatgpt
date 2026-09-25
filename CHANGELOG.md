@@ -11,9 +11,13 @@
 
 ## Unreleased — CAIS ChatGPT
 
-* Changed extraction to follow the pinned Utrecht `port-chatgpt-uu` reference, restoring recursive field matching, nested message-part conversion, exact hidden-flag handling, and local-time timestamp formatting.
-* Separated reference extraction from CAIS validation, twelve-month selection, sorting, and lossless table partitioning.
-* Added reference-output regression cases cross-checked against the original extractor in UTC and Europe/Amsterdam.
+* Changed extraction from the Utrecht reference's recursive substring matching to explicit field parsing. Donated keys, values and local-time formatting are unchanged: verified message-by-message against the unmodified reference on four real exports, including branches, image parts (flattened like the reference) and reasoning messages (rows with an empty message). Similarly named metadata can no longer override roles/models or be appended to message text.
+* Changed parsing to accept only the observed export format: numeric Unix-second timestamps, boolean hidden flags, string titles and known content types. Anything else is reported as a processing issue rather than guessed.
+* Added per-record failure handling: a malformed message or conversation is excluded without discarding the rest of the export, and reported in a donated `chatgpt_processing_issues_N` table (positions and fixed reason codes only, no participant text). Exports without issues donate unchanged JSON; exports where failures leave no usable messages offer a retry.
+* Added support for split exports: `conversations.json` files listed in `export_manifest.json` are read in order, one at a time, keeping peak memory to one file.
+* Added archive safeguards: 256 MiB per JSON file, rejection of missing listed files, duplicate JSON keys, unreadable or excessively nested JSON, and text that cannot be serialized.
+* Fixed future-dated timestamps passing the twelve-month filter.
+* Removed `port/helpers.py` (reference fuzzy-matching helpers).
 * Changed study table titles to “Your conversations with ChatGPT” (with German and Dutch equivalents); omitted the title suffix for a single table while retaining part numbers for multiple tables.
 * Changed the CAIS table to show capitalized column labels (German and Dutch equivalents) and relative column widths: message widest, then conversation title. Uses the upstream display-only `headers` and `column_widths`; donated keys are unchanged.
 * Changed the consent-page introduction to the Utrecht study's wording (English and Dutch verbatim from `port-chatgpt-uu`). The German text is a provisional Eyra translation; replace it with the approved CAIS wording when available.

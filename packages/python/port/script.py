@@ -1,19 +1,21 @@
 """CAIS ChatGPT data-donation flow.
 
-The Utrecht extraction lives in port.chatgpt and port.helpers. This module
-adds the CAIS upload validation, twelve-month filter, sorting and lossless
-table partitioning using the current Feldspar file and consent APIs.
+Explicit ChatGPT parsing lives in port.chatgpt. This module handles bounded,
+part-by-part archive loading, lossless review-table partitioning and the
+Feldspar consent flow, including a donated report of records that could not be
+processed.
 """
 
 from __future__ import annotations
 
-from collections.abc import Generator
-from datetime import datetime, timezone
+from collections.abc import Generator, Iterator
+from datetime import datetime
 from pathlib import PurePosixPath
 import json
 import logging
 from typing import Any
 import zipfile
+import zlib
 
 import pandas as pd
 
@@ -25,6 +27,8 @@ from port.chatgpt import MESSAGE_COLUMNS
 logger = logging.getLogger(__name__)
 
 CHATGPT_EXPORT_FILE = "conversations.json"
+EXPORT_MANIFEST_FILE = "export_manifest.json"
+MAX_EXPORT_JSON_BYTES = 256 * 1024 * 1024
 MIN_TABLE_ROW_LIMIT = 10_000
 MAX_TABLE_ROW_LIMIT = 50_000
 TABLE_ROW_LIMIT = 10_000
@@ -36,22 +40,22 @@ class InvalidChatGPTExport(ValueError):
 
 def process(data: dict[str, str]) -> Generator:
     session_id = data.get("sessionId", "")
-    tables: list[pd.DataFrame] | None = None
+    extraction: chatgpt.ExtractionResult | None = None
 
     while True:
         file_result = yield render_data_submission_page([prompt_file()])
         if file_result.__type__ != "PayloadFile":
             return
 
-        tables, retry = yield from extract_tables(file_result.value)
+        extraction, retry = yield from extract_export(file_result.value)
         if retry:
             continue
         break
 
-    if tables is None:
+    if extraction is None:
         return
 
-    result = yield render_data_submission_page(prompt_consent(tables))
+    result = yield render_data_submission_page(prompt_consent(extraction))
     if result.__type__ == "PayloadJSON":
         yield donate(f"{session_id}-chatgpt-conversations", result.value)
     elif result.__type__ == "PayloadFalse":
@@ -61,79 +65,125 @@ def process(data: dict[str, str]) -> Generator:
         )
 
 
-def extract_tables(
+def extract_export(
     path: Any, now: datetime | None = None
-) -> Generator[object, None, tuple[list[pd.DataFrame] | None, bool]]:
+) -> Generator[object, None, tuple[chatgpt.ExtractionResult | None, bool]]:
+    no_usable_messages = False
     try:
-        conversations = load_conversations(path)
-        frame = conversations_to_dataframe(conversations, now=now)
-        tables = partition_dataframe(frame)
+        extraction = chatgpt.extract_conversations(iter_conversations(path), now=now)
+        for reason, count in extraction.issues["reason"].value_counts().items():
+            logger.warning("ChatGPT extraction issue %s: %s record(s)", reason, count)
+        no_usable_messages = extraction.messages.empty and not extraction.issues.empty
+        if no_usable_messages:
+            raise InvalidChatGPTExport("processing failures left no messages in the study window")
         logger.info(
-            "Extracted %s ChatGPT messages into %s review table(s)",
-            len(frame),
-            len(tables),
+            "Extracted %s ChatGPT messages with %s processing issue(s)",
+            len(extraction.messages),
+            len(extraction.issues),
         )
         yield FlushLogs
-        return tables, False
+        return extraction, False
     except InvalidChatGPTExport as error:
         logger.info("Rejected ChatGPT export: %s", error)
-        retry_result = yield render_data_submission_page([retry_confirmation()])
+        yield FlushLogs
+        retry_result = yield render_data_submission_page(
+            [retry_confirmation(no_usable_messages)]
+        )
         return None, retry_result.__type__ == "PayloadTrue"
 
 
-def load_conversations(path: Any) -> list[dict[str, Any]]:
-    """Read and structurally validate the archive's conversations payload."""
+def iter_conversations(path: Any) -> Iterator[Any]:
+    """Yield the export's conversations, one conversations file at a time.
+
+    Large exports may split conversations.json into several files. Each file
+    is parsed only when the previous one is exhausted and released, so peak
+    memory is one file rather than the whole export. The ZIP itself is read
+    lazily from the upload. A file that cannot be read rejects the export.
+    """
     try:
         with zipfile.ZipFile(path) as archive:
-            candidates = [
-                info
-                for info in archive.infolist()
-                if not info.is_dir()
-                and PurePosixPath(info.filename).name == CHATGPT_EXPORT_FILE
-            ]
-            if len(candidates) != 1:
-                raise InvalidChatGPTExport(
-                    f"expected one {CHATGPT_EXPORT_FILE}, found {len(candidates)}"
-                )
-
-            with archive.open(candidates[0]) as source:
-                conversations = json.load(source)
+            for member in conversation_members(archive):
+                conversations = read_json_member(archive, member)
+                if not isinstance(conversations, list):
+                    raise InvalidChatGPTExport("conversations JSON must contain a list")
+                yield from conversations
+                del conversations
     except InvalidChatGPTExport:
         raise
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError, zipfile.BadZipFile) as error:
+    except (
+        OSError, UnicodeDecodeError, ValueError, zipfile.BadZipFile,
+        RuntimeError, NotImplementedError, EOFError, RecursionError, zlib.error,
+    ) as error:
         raise InvalidChatGPTExport("archive or conversations JSON cannot be read") from error
 
-    if not isinstance(conversations, list):
-        raise InvalidChatGPTExport("conversations JSON must contain a list")
-    if not all(
-        isinstance(conversation, dict)
-        and "title" in conversation
-        and isinstance(conversation.get("mapping"), dict)
-        for conversation in conversations
-    ):
-        raise InvalidChatGPTExport("every conversation must have a title and mapping")
 
-    return conversations
+def conversation_members(archive: zipfile.ZipFile) -> list[zipfile.ZipInfo]:
+    """Resolve the conversations files, in order, from the export manifest.
 
-
-def conversations_to_dataframe(
-    conversations: list[dict[str, Any]], now: datetime | None = None
-) -> pd.DataFrame:
-    """Apply CAIS time selection/order without changing the Utrecht field values.
-
-    The cutoff uses absolute UTC time, not the reference's local display string.
-    Undated/unparseable messages cannot be assigned to the study window and are
-    excluded here, not by the reference extractor.
+    Current exports list every logical file and its (possibly split) physical
+    files in export_manifest.json, relative to the manifest. Exports without
+    such a manifest must contain exactly one conversations.json.
     """
-    current_time = normalise_utc(now or datetime.now(timezone.utc))
-    cutoff = twelve_month_cutoff(current_time).timestamp()
-    frame = chatgpt.conversations_to_df(conversations)
-    timestamps = pd.to_numeric(frame["_create_time"], errors="coerce")
-    in_window = timestamps.ge(cutoff) & timestamps.lt(float("inf"))
-    ordered_index = timestamps[in_window].sort_values(
-        ascending=False, kind="stable"
-    ).index
-    return frame.loc[ordered_index, [*MESSAGE_COLUMNS, "_conversation"]].reset_index(drop=True)
+    files = {info.filename: info for info in archive.infolist() if not info.is_dir()}
+    manifests = []
+    for name, info in files.items():
+        if PurePosixPath(name).name == EXPORT_MANIFEST_FILE:
+            manifest = read_json_member(archive, info)
+            # Exports also contain other manifests (e.g. sites/) without files.
+            if isinstance(manifest, dict) and "logical_files" in manifest:
+                manifests.append((PurePosixPath(name).parent, manifest))
+    if len(manifests) > 1:
+        raise InvalidChatGPTExport(f"expected at most one {EXPORT_MANIFEST_FILE} listing files")
+
+    if not manifests:
+        candidates = [
+            info for name, info in files.items()
+            if PurePosixPath(name).name == CHATGPT_EXPORT_FILE
+        ]
+        if len(candidates) != 1:
+            raise InvalidChatGPTExport(
+                f"expected one {CHATGPT_EXPORT_FILE}, found {len(candidates)}"
+            )
+        return candidates
+
+    base, manifest = manifests[0]
+    logical_files = manifest["logical_files"]
+    entry = logical_files.get(CHATGPT_EXPORT_FILE) if isinstance(logical_files, dict) else None
+    parts = entry.get("files") if isinstance(entry, dict) else None
+    if (
+        not isinstance(parts, list) or not parts
+        or not all(isinstance(part, str) for part in parts)
+        or len(set(parts)) != len(parts)
+    ):
+        raise InvalidChatGPTExport("export manifest does not list the conversations files")
+    members = []
+    for part in parts:
+        name = str(base / part)
+        if name not in files:
+            raise InvalidChatGPTExport("a conversations file listed in the manifest is missing")
+        members.append(files[name])
+    return members
+
+
+def read_json_member(archive: zipfile.ZipFile, member: zipfile.ZipInfo) -> Any:
+    """Parse one archive member, refusing files over the per-file size limit."""
+    if member.file_size > MAX_EXPORT_JSON_BYTES:
+        raise InvalidChatGPTExport("export JSON file exceeds the size limit")
+    with archive.open(member) as source:
+        payload = source.read(MAX_EXPORT_JSON_BYTES + 1)
+    if len(payload) > MAX_EXPORT_JSON_BYTES:
+        raise InvalidChatGPTExport("export JSON file exceeds the size limit")
+    return json.loads(payload, object_pairs_hook=unique_json_object)
+
+
+def unique_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    """Reject ambiguous duplicate fields instead of silently selecting the last."""
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise InvalidChatGPTExport("export JSON contains duplicate object keys")
+        result[key] = value
+    return result
 
 
 def partition_dataframe(
@@ -169,20 +219,6 @@ def validate_table_row_limit(row_limit: int) -> None:
         )
 
 
-def normalise_utc(value: datetime) -> datetime:
-    if value.tzinfo is None:
-        return value.replace(tzinfo=timezone.utc)
-    return value.astimezone(timezone.utc)
-
-
-def twelve_month_cutoff(value: datetime) -> datetime:
-    try:
-        return value.replace(year=value.year - 1)
-    except ValueError:  # 29 February to a non-leap year
-        return value.replace(year=value.year - 1, day=28)
-
-
-
 
 def render_data_submission_page(body: list[Any]) -> CommandUIRender:
     header = props.PropsUIHeader(
@@ -210,20 +246,33 @@ def prompt_file() -> props.PropsUIPromptFileInput:
     )
 
 
-def retry_confirmation() -> props.PropsUIPromptConfirm:
+def retry_confirmation(no_usable_messages: bool = False) -> props.PropsUIPromptConfirm:
     return props.PropsUIPromptConfirm(
         props.Translatable(
             {
-                "en": "We could not verify this as a ChatGPT data export. Please select a different ZIP file.",
-                "de": "Diese Datei konnte nicht als ChatGPT-Datenexport bestätigt werden. Bitte wählen Sie eine andere ZIP-Datei.",
-                "nl": "We konden dit bestand niet verifiëren als een ChatGPT-data-export. Selecteer een ander ZIP-bestand.",
+                "en": (
+                    "Some records could not be processed, and no messages remain within the last 12 months. Please select a different ZIP file."
+                    if no_usable_messages else
+                    "We could not read this ChatGPT export. Please select the unmodified ZIP file you received from ChatGPT."
+                ),
+                "de": (
+                    "Einige Datensätze konnten nicht verarbeitet werden, und es verbleiben keine Nachrichten aus den letzten 12 Monaten. Bitte wählen Sie eine andere ZIP-Datei."
+                    if no_usable_messages else
+                    "Dieser ChatGPT-Export konnte nicht gelesen werden. Bitte wählen Sie die unveränderte ZIP-Datei, die Sie von ChatGPT erhalten haben."
+                ),
+                "nl": (
+                    "Sommige gegevens konden niet worden verwerkt en er blijven geen berichten uit de afgelopen 12 maanden over. Selecteer een ander ZIP-bestand."
+                    if no_usable_messages else
+                    "Deze ChatGPT-export kon niet worden gelezen. Selecteer het ongewijzigde ZIP-bestand dat u van ChatGPT hebt ontvangen."
+                ),
             }
         ),
         props.Translatable({"en": "Try again", "de": "Erneut versuchen", "nl": "Probeer opnieuw"}),
     )
 
 
-def prompt_consent(tables: list[pd.DataFrame]) -> list[Any]:
+def prompt_consent(extraction: chatgpt.ExtractionResult) -> list[Any]:
+    tables = partition_dataframe(extraction.messages)
     table_count = len(tables)
     titles = {
         "en": "Your conversations with ChatGPT",
@@ -241,7 +290,7 @@ def prompt_consent(tables: list[pd.DataFrame]) -> list[Any]:
         "time": props.Translatable({"en": "Time", "de": "Zeit", "nl": "Tijd"}),
     }
     column_widths = {"conversation title": 3, "role": 1, "message": 6, "model": 1.2, "time": 1.8}
-    consent_tables = [
+    consent_tables: list[Any] = [
         props.PropsUIPromptConsentFormTable(
             id=f"chatgpt_conversations_{number}",
             number=number,
@@ -265,6 +314,38 @@ def prompt_consent(tables: list[pd.DataFrame]) -> list[Any]:
         )
         for number, table in enumerate(tables, start=1)
     ]
+    issue_count = len(extraction.issues)
+    issue_table_count = (issue_count + TABLE_ROW_LIMIT - 1) // TABLE_ROW_LIMIT
+    if issue_count:
+        issue_description = props.Translatable({
+            "en": f"Some records could not be processed ({issue_count} issues) and were excluded. Conversation and message numbers below refer to their positions in the export. This report is included in your donation; you may remove rows before donating.",
+            "de": f"Einige Datensätze konnten nicht verarbeitet werden ({issue_count} Probleme) und wurden ausgeschlossen. Die Nummern beziehen sich auf ihre Positionen im Export. Dieser Bericht wird mitgespendet; Sie können vor der Spende Zeilen entfernen.",
+            "nl": f"Sommige gegevens konden niet worden verwerkt ({issue_count} problemen) en zijn uitgesloten. De nummers hieronder verwijzen naar hun positie in de export. Dit rapport wordt meegedoneerd; u kunt voor het doneren rijen verwijderen.",
+        })
+        consent_tables.append(props.PropsUIPromptText(issue_description))
+    for number, start in enumerate(range(0, issue_count, TABLE_ROW_LIMIT), start=1):
+        suffix = "" if issue_table_count == 1 else f" ({number}/{issue_table_count})"
+        consent_tables.append(
+            props.PropsUIPromptConsentFormTable(
+                id=f"chatgpt_processing_issues_{number}",
+                number=table_count + number,
+                title=props.Translatable({
+                    "en": f"Processing issues{suffix}",
+                    "de": f"Verarbeitungsprobleme{suffix}",
+                    "nl": f"Verwerkingsproblemen{suffix}",
+                }),
+                description=issue_description,
+                data_frame=extraction.issues.iloc[start:start + TABLE_ROW_LIMIT].reset_index(drop=True),
+                data_frame_max_size=TABLE_ROW_LIMIT,
+                headers={
+                    "conversation": props.Translatable({"en": "Conversation", "de": "Unterhaltung", "nl": "Gesprek"}),
+                    "message": props.Translatable({"en": "Message", "de": "Nachricht", "nl": "Bericht"}),
+                    "reason": props.Translatable({"en": "Reason", "de": "Grund", "nl": "Reden"}),
+                    "action": props.Translatable({"en": "Result", "de": "Ergebnis", "nl": "Resultaat"}),
+                },
+                column_widths={"conversation": 1, "message": 1, "reason": 3, "action": 2},
+            )
+        )
     return [
         props.PropsUIPromptText(
             props.Translatable(
@@ -302,7 +383,7 @@ if __name__ == "__main__":
         print("Usage: python -m port.script path/to/chatgpt-export.zip")
         raise SystemExit(1)
 
-    generator = extract_tables(sys.argv[1])
+    generator = extract_export(sys.argv[1])
     try:
         while True:
             next(generator)
