@@ -37,8 +37,8 @@ def conversation(mapping=None, **overrides):
     return value
 
 
-def extract(*conversations, now=NOW):
-    return chatgpt.extract_conversations(list(conversations), now=now)
+def extract(*conversations, now=NOW, window_months=None):
+    return chatgpt.extract_conversations(list(conversations), now=now, window_months=window_months)
 
 
 @pytest.fixture
@@ -255,7 +255,7 @@ def test_utc_calendar_year_boundaries_are_inclusive_and_future_is_reported(now):
         ("old", cutoff - timedelta(microseconds=1)),
         ("cutoff", cutoff), ("now", NOW), ("future", NOW + timedelta(microseconds=1)),
     ]
-    result = extract(conversation({name: node(create_time=value.timestamp(), content={"parts": [name]}) for name, value in values}), now=now)
+    result = extract(conversation({name: node(create_time=value.timestamp(), content={"parts": [name]}) for name, value in values}), now=now, window_months=12)
     assert result.messages["message"].tolist() == ["now", "cutoff"]
     assert result.issues.to_dict("records") == [{"conversation": "1", "message": "4", "reason": "future_timestamp", "action": "message_excluded"}]
 
@@ -265,7 +265,7 @@ def test_leap_day_cutoff_falls_back_to_february_28_with_same_utc_time():
     result = extract(conversation({
         "old": node(create_time=datetime(2023, 2, 28, 8, 59, 59, tzinfo=timezone.utc).timestamp()),
         "boundary": node(create_time=datetime(2023, 2, 28, 9, tzinfo=timezone.utc).timestamp(), content={"parts": ["boundary"]}),
-    }), now=now)
+    }), now=now, window_months=12)
     assert result.messages["message"].tolist() == ["boundary"]
     assert result.issues.empty
 
@@ -330,6 +330,36 @@ def test_out_of_window_messages_do_not_need_content_parsing():
     result = extract(conversation({
         "old": node(create_time=datetime(2020, 1, 1, tzinfo=timezone.utc).timestamp(), content={"unknown_format": "old"}),
         "current": node(),
-    }))
+    }), window_months=12)
     assert result.messages["message"].tolist() == ["Hello world"]
     assert result.issues.empty
+    assert result.outside_window == 1
+
+
+@pytest.mark.parametrize("months, first_kept", [
+    # 31 March minus one month clamps to the end of February.
+    (1, datetime(2026, 2, 28, 12, tzinfo=timezone.utc)),
+    (24, datetime(2024, 3, 31, 12, tzinfo=timezone.utc)),
+])
+def test_window_counts_back_calendar_months(months, first_kept):
+    result = extract(conversation({
+        "before": node(create_time=(first_kept - timedelta(seconds=1)).timestamp(), content={"parts": ["before"]}),
+        "first": node(create_time=first_kept.timestamp(), content={"parts": ["first"]}),
+    }), now=datetime(2026, 3, 31, 12, tzinfo=timezone.utc), window_months=months)
+    assert result.messages["message"].tolist() == ["first"]
+    assert result.outside_window == 1
+
+
+def test_without_window_all_messages_are_kept():
+    result = extract(conversation({
+        "old": node(create_time=datetime(2010, 1, 1, tzinfo=timezone.utc).timestamp()),
+        "new": node(),
+    }))
+    assert len(result.messages) == 2
+    assert result.outside_window == 0
+
+
+@pytest.mark.parametrize("months", [0, -1, True])
+def test_window_must_be_a_positive_number_of_months(months):
+    with pytest.raises(ValueError):
+        extract(conversation(), window_months=months)

@@ -45,6 +45,11 @@ MAX_EXPORT_JSON_BYTES = 256 * 1024 * 1024
 MIN_TABLE_ROW_LIMIT = 10_000
 MAX_TABLE_ROW_LIMIT = 50_000
 TABLE_ROW_LIMIT = 10_000
+# Time window: messages from the last N calendar months (UTC) before the
+# upload; None keeps all messages. A test release with another window is a
+# branch that changes only this value. Locally: python -m port.script
+# export.zip --window-months 24 (or none).
+TIME_WINDOW_MONTHS: int | None = 24
 
 
 class InvalidChatGPTExport(ValueError):
@@ -66,14 +71,12 @@ def process(data: dict[str, str]) -> Generator:
             yield donate_logs(tracking_key)
             return
 
-        extraction, no_usable_messages = extract_export(file_result.value)
+        extraction, problem = extract_export(file_result.value)
         yield donate_logs(tracking_key)
         if extraction is not None:
             break
 
-        retry_result = yield render_data_submission_page(
-            [retry_confirmation(no_usable_messages)]
-        )
+        retry_result = yield render_data_submission_page([nothing_to_donate(problem)])
         if retry_result.__type__ != "PayloadTrue":
             logger.info("Skipped during retry flow")
             yield donate_logs(tracking_key)
@@ -96,22 +99,28 @@ def process(data: dict[str, str]) -> Generator:
 
 def extract_export(
     path: Any, now: datetime | None = None
-) -> tuple[chatgpt.ExtractionResult | None, bool]:
-    """Return the extraction, or None and whether processing failures left no messages.
+) -> tuple[chatgpt.ExtractionResult | None, str | None]:
+    """Return the extraction, or None and why the export cannot be used.
 
-    Rejections, format changes and skipped messages are logged as warnings, so
-    they reach both the tracking donation (researchers) and the host log
-    (AppSignal). Skipped messages are logged as one summary line with counts
-    per reason and result.
+    The reason is "unreadable" or "unusable" (processing failures left no
+    messages). An export without messages in the time window is returned
+    normally: the participant still completes the consent step with an empty
+    table, which is informative for researchers too. Rejections, format changes
+    and skipped messages are logged as warnings, so they reach both the
+    tracking donation (researchers) and the host log (AppSignal). Skipped
+    messages are logged as one summary line with counts per reason and result.
     """
+    logger.info("Time window: %s", window_label())
     try:
-        extraction = chatgpt.extract_conversations(iter_conversations(path), now=now)
+        extraction = chatgpt.extract_conversations(
+            iter_conversations(path), now=now, window_months=TIME_WINDOW_MONTHS
+        )
     except InvalidChatGPTExport as error:
         logger.warning("Rejected ChatGPT export: %s", error)
-        return None, False
+        return None, "unreadable"
     except chatgpt.UnsupportedExportFormat as error:
         logger.warning("Rejected ChatGPT export: unsupported format, %s", error)
-        return None, False
+        return None, "unreadable"
 
     if not extraction.issues.empty:
         counts = extraction.issues.value_counts(["reason", "action"], sort=False)
@@ -120,14 +129,26 @@ def extract_export(
             ", ".join(f"{reason} {action}={count}" for (reason, action), count in counts.items()),
         )
     logger.info(
-        "Extracted %s ChatGPT messages with %s processing issue(s)",
+        "Extracted %s ChatGPT messages (%s outside the time window) with %s processing issue(s)",
         len(extraction.messages),
+        extraction.outside_window,
         len(extraction.issues),
     )
-    if extraction.messages.empty and not extraction.issues.empty:
-        logger.warning("Rejected ChatGPT export: processing failures left no messages in the study window")
-        return None, True
-    return extraction, False
+    if extraction.messages.empty:
+        if not extraction.issues.empty:
+            logger.warning("Rejected ChatGPT export: processing failures left no messages in the time window")
+            return None, "unusable"
+        if extraction.outside_window:
+            logger.info("No messages to donate: all messages are outside the time window")
+        else:
+            logger.info("No messages to donate: the export contains no messages")
+    return extraction, None
+
+
+def window_label() -> str:
+    if TIME_WINDOW_MONTHS is None:
+        return "all messages"
+    return f"last {TIME_WINDOW_MONTHS} months"
 
 
 def iter_conversations(path: Any) -> Iterator[Any]:
@@ -284,29 +305,47 @@ def prompt_file() -> props.PropsUIPromptFileInput:
     )
 
 
-def retry_confirmation(no_usable_messages: bool = False) -> props.PropsUIPromptConfirm:
+def window_phrase() -> dict[str, str]:
+    """Per-locale " from the last N months", or "" without a window."""
+    months = TIME_WINDOW_MONTHS
+    if months is None:
+        return {"en": "", "de": "", "nl": ""}
+    return {
+        "en": f" from the last {months} months",
+        "de": f" aus den letzten {months} Monaten",
+        "nl": f" uit de afgelopen {months} maanden",
+    }
+
+
+def nothing_to_donate(problem: str | None) -> props.PropsUIPromptConfirm:
+    """Why the export cannot be used; ok retries with another file."""
+    within = window_phrase()
+    if problem == "unusable":
+        text = {
+            "en": f"Some records could not be processed, and no messages{within['en']} remain. Please select a different ZIP file.",
+            "de": f"Einige Datensätze konnten nicht verarbeitet werden, und es verbleiben keine Nachrichten{within['de']}. Bitte wählen Sie eine andere ZIP-Datei.",
+            "nl": f"Sommige gegevens konden niet worden verwerkt en er blijven geen berichten{within['nl']} over. Selecteer een ander ZIP-bestand.",
+        }
+    else:
+        text = {
+            "en": "We could not read this ChatGPT export. Please select the unmodified ZIP file you received from ChatGPT.",
+            "de": "Dieser ChatGPT-Export konnte nicht gelesen werden. Bitte wählen Sie die unveränderte ZIP-Datei, die Sie von ChatGPT erhalten haben.",
+            "nl": "Deze ChatGPT-export kon niet worden gelezen. Selecteer het ongewijzigde ZIP-bestand dat u van ChatGPT hebt ontvangen.",
+        }
     return props.PropsUIPromptConfirm(
-        props.Translatable(
-            {
-                "en": (
-                    "Some records could not be processed, and no messages remain within the last 12 months. Please select a different ZIP file."
-                    if no_usable_messages else
-                    "We could not read this ChatGPT export. Please select the unmodified ZIP file you received from ChatGPT."
-                ),
-                "de": (
-                    "Einige Datensätze konnten nicht verarbeitet werden, und es verbleiben keine Nachrichten aus den letzten 12 Monaten. Bitte wählen Sie eine andere ZIP-Datei."
-                    if no_usable_messages else
-                    "Dieser ChatGPT-Export konnte nicht gelesen werden. Bitte wählen Sie die unveränderte ZIP-Datei, die Sie von ChatGPT erhalten haben."
-                ),
-                "nl": (
-                    "Sommige gegevens konden niet worden verwerkt en er blijven geen berichten uit de afgelopen 12 maanden over. Selecteer een ander ZIP-bestand."
-                    if no_usable_messages else
-                    "Deze ChatGPT-export kon niet worden gelezen. Selecteer het ongewijzigde ZIP-bestand dat u van ChatGPT hebt ontvangen."
-                ),
-            }
-        ),
+        props.Translatable(text),
         props.Translatable({"en": "Try again", "de": "Erneut versuchen", "nl": "Probeer opnieuw"}),
     )
+
+
+def no_messages_notice(extraction: chatgpt.ExtractionResult) -> props.PropsUIPromptText:
+    """Why the table is empty; the participant still completes the step."""
+    within = window_phrase() if extraction.outside_window else {"en": "", "de": "", "nl": ""}
+    return props.PropsUIPromptText(props.Translatable({
+        "en": f"Your ChatGPT export contains no messages{within['en']}, so the table below is empty. Please click “Yes, donate” to complete this step.",
+        "de": f"Ihr ChatGPT-Export enthält keine Nachrichten{within['de']}, daher ist die Tabelle unten leer. Bitte klicken Sie auf „Ja, spenden“, um diesen Schritt abzuschließen.",
+        "nl": f"Uw ChatGPT-export bevat geen berichten{within['nl']}, daarom is de tabel hieronder leeg. Klik op ‘Ja, doneer’ om deze stap af te ronden.",
+    }))
 
 
 def prompt_consent(extraction: chatgpt.ExtractionResult) -> list[Any]:
@@ -340,9 +379,15 @@ def prompt_consent(extraction: chatgpt.ExtractionResult) -> list[Any]:
             ),
             description=props.Translatable(
                 {
-                    "en": "Messages from the last 12 months, newest first.",
-                    "de": "Nachrichten der letzten 12 Monate, neueste zuerst.",
-                    "nl": "Berichten van de afgelopen 12 maanden, nieuwste eerst.",
+                    "en": "All messages, newest first.",
+                    "de": "Alle Nachrichten, neueste zuerst.",
+                    "nl": "Alle berichten, nieuwste eerst.",
+                }
+                if TIME_WINDOW_MONTHS is None else
+                {
+                    "en": f"Messages from the last {TIME_WINDOW_MONTHS} months, newest first.",
+                    "de": f"Nachrichten der letzten {TIME_WINDOW_MONTHS} Monate, neueste zuerst.",
+                    "nl": f"Berichten van de afgelopen {TIME_WINDOW_MONTHS} maanden, nieuwste eerst.",
                 }
             ),
             data_frame=table,
@@ -362,6 +407,7 @@ def prompt_consent(extraction: chatgpt.ExtractionResult) -> list[Any]:
                 }
             )
         ),
+        *([no_messages_notice(extraction)] if extraction.messages.empty else []),
         *consent_tables,
         props.PropsUIDataSubmissionButtons(
             donate_question=props.Translatable(
@@ -390,10 +436,33 @@ def donate_logs(key: str) -> CommandSystemDonate:
 
 
 if __name__ == "__main__":
-    import sys
+    import argparse
 
-    if len(sys.argv) < 2:
-        print("Usage: python -m port.script path/to/chatgpt-export.zip")
-        raise SystemExit(1)
-
-    print(extract_export(sys.argv[1]))
+    parser = argparse.ArgumentParser(
+        prog="python -m port.script",
+        description="Run the extraction on a ChatGPT export locally. Prints the "
+        "tracking log and counts only, never message content.",
+    )
+    parser.add_argument("export", help="path to the ChatGPT export ZIP")
+    parser.add_argument(
+        "--window-months",
+        default=str(TIME_WINDOW_MONTHS),
+        help='time window in months, or "none" for all messages (default: %(default)s)',
+    )
+    arguments = parser.parse_args()
+    TIME_WINDOW_MONTHS = (
+        None if arguments.window_months.lower() == "none" else int(arguments.window_months)
+    )
+    extraction, problem = extract_export(arguments.export)
+    print(LOG_STREAM.getvalue(), end="")
+    if extraction is None:
+        print(f"Export rejected: {problem}")
+    elif extraction.messages.empty:
+        print("Would donate an empty table: no messages in the time window")
+    else:
+        messages = extraction.messages
+        print(
+            f"Would donate {len(messages)} messages from "
+            f"{messages['_conversation'].nunique()} conversations, "
+            f"{messages['time'].iloc[-1]} to {messages['time'].iloc[0]}"
+        )

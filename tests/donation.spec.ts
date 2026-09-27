@@ -129,7 +129,10 @@ async function submitDonation(page: Page, donations: Donation[]): Promise<Submit
 test('reviews and submits visible ChatGPT messages from the export', async ({ page }) => {
   const donations = await uploadChatGPTExport(page);
 
-  await expect(page.getByText('Messages from the last 12 months, newest first.', { exact: true })).toBeVisible();
+  const consentTable = page.locator('div.mb-20', {
+    has: page.getByTestId('table-chatgpt_conversations_1'),
+  });
+  await expect(consentTable.locator(':scope > .text-bodymedium')).toBeVisible();
   const table = page.getByTestId('table-chatgpt_conversations_1');
   // Labels are display-only: donated keys below stay lowercase.
   await expect(table.getByRole('columnheader', { name: 'Message', exact: true })).toBeVisible();
@@ -140,7 +143,7 @@ test('reviews and submits visible ChatGPT messages from the export', async ({ pa
   const { tables, tracking } = await submitDonation(page, donations);
   expect(Object.keys(tables)).toEqual(['chatgpt_conversations_1']);
   expect(tables.chatgpt_conversations_1.data).toEqual([newestRow, questionRow]);
-  expect(tracking).toContain('Extracted 2 ChatGPT messages with 0 processing issue(s)');
+  expect(tracking).toContain('Extracted 2 ChatGPT messages (0 outside the time window) with 0 processing issue(s)');
   expect(tracking).not.toContain('Processing issues');
 });
 
@@ -177,6 +180,23 @@ test('skips unusable messages and reports them only in the tracking donation', a
   expect(tracking).toContain('unknown_content_type:canvas message_excluded=1');
   expect(tracking).toContain('future_timestamp message_excluded=1');
   expect(raw).not.toContain(secretText);
+});
+
+test('still asks to donate when no messages fall inside the time window', async ({ page }) => {
+  const donations = await openDonation(page);
+  const threeYearsAgo = (referenceDay - 3 * 365 * day) / 1000;
+  await chooseExport(page, exportFile([
+    { title: secretTitle, mapping: { old: messageNode(secretText, threeYearsAgo) } },
+  ]));
+
+  await expect(page.getByText('Your ChatGPT export contains no messages')).toBeVisible();
+  await expect(page.getByText(secretText)).not.toBeVisible();
+
+  const { tables, tracking, raw } = await submitDonation(page, donations);
+  expect(Object.keys(tables)).toEqual(['chatgpt_conversations_1']);
+  expect(tables.chatgpt_conversations_1.data).toEqual([]);
+  expect(tracking).toContain('No messages to donate: all messages are outside the time window');
+  expect(raw).not.toContain('SECRET');
 });
 
 test('rejects a changed export format at once and tracks the reason', async ({ page }) => {

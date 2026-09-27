@@ -199,6 +199,7 @@ def test_extraction_keeps_visible_recent_messages_in_descending_time_order():
             ),
         ],
         now=NOW,
+        window_months=12,
     )
     frame = extraction.messages
 
@@ -309,8 +310,8 @@ def test_partial_export_keeps_valid_messages_and_logs_one_summary(tmp_path, capl
         conversation("PRIVATE_TITLE", [message("user", timestamp(2026, 9, 22), ["PRIVATE_TEXT"])]),
     ]
     with caplog.at_level("WARNING", logger="port.script"):
-        extraction, no_usable_messages = script.extract_export(write_export(tmp_path, payload), now=NOW)
-    assert no_usable_messages is False
+        extraction, problem = script.extract_export(write_export(tmp_path, payload), now=NOW)
+    assert problem is None
     assert extraction.messages["message"].tolist() == ["Kept"]
     warnings = [record.getMessage() for record in caplog.records if record.name == "port.script"]
     assert warnings == [
@@ -324,7 +325,7 @@ def test_format_change_rejects_export_and_logs_its_position(tmp_path, caplog):
         conversation("PRIVATE_TITLE", [message("user", "2026-09-20T12:00:00Z", ["PRIVATE_TEXT"])]),
     ]
     with caplog.at_level("WARNING", logger="port.script"):
-        assert script.extract_export(write_export(tmp_path, payload), now=NOW) == (None, False)
+        assert script.extract_export(write_export(tmp_path, payload), now=NOW) == (None, "unreadable")
     assert caplog.records[-1].getMessage() == (
         "Rejected ChatGPT export: unsupported format, reason=invalid_timestamp conversation=2 message=1"
     )
@@ -333,15 +334,30 @@ def test_format_change_rejects_export_and_logs_its_position(tmp_path, caplog):
 
 def test_export_with_only_skipped_messages_is_rejected(tmp_path):
     payload = [conversation("Failed", [canvas_message(timestamp(2026, 9, 20))])]
-    assert script.extract_export(write_export(tmp_path, payload), now=NOW) == (None, True)
+    assert script.extract_export(write_export(tmp_path, payload), now=NOW) == (None, "unusable")
 
 
-def test_old_messages_are_not_reported_as_parsing_failures(tmp_path):
-    payload = [conversation("Old", [message("user", timestamp(2020, 1, 1), ["Old"])])]
-    extraction, no_usable_messages = script.extract_export(write_export(tmp_path, payload), now=NOW)
-    assert no_usable_messages is False
+@pytest.mark.parametrize("payload, outside_window", [
+    ([conversation("Old", [message("user", timestamp(2020, 1, 1), ["Old"])])], 1),
+    ([conversation("Empty", [])], 0),
+])
+def test_nothing_in_the_window_still_reaches_consent_not_failures(tmp_path, payload, outside_window):
+    extraction, problem = script.extract_export(write_export(tmp_path, payload), now=NOW)
+    assert problem is None
     assert extraction.messages.empty
     assert extraction.issues.empty
+    assert extraction.outside_window == outside_window
+
+
+@pytest.mark.parametrize("window, kept", [(12, []), (24, ["20 months old"]), (None, ["20 months old", "2020"])])
+def test_time_window_setting_selects_messages(tmp_path, monkeypatch, window, kept):
+    monkeypatch.setattr(script, "TIME_WINDOW_MONTHS", window)
+    payload = [conversation("Mixed", [
+        message("user", timestamp(2025, 1, 21), ["20 months old"]),
+        message("user", timestamp(2020, 1, 1), ["2020"]),
+    ])]
+    extraction, _ = script.extract_export(write_export(tmp_path, payload), now=NOW)
+    assert extraction.messages["message"].tolist() == kept
 
 
 FLOW = textwrap.dedent("""
@@ -403,4 +419,14 @@ def test_tracking_records_a_format_change_rejection(tmp_path):
     tracking = "\n".join(donations[-1][1])
     assert "unsupported format, reason=invalid_timestamp conversation=1 message=1" in tracking
     assert "Skipped during retry flow" in tracking
+    assert "PRIVATE" not in tracking
+
+
+def test_empty_window_still_donates_and_tracks_why(tmp_path):
+    payload = [conversation("PRIVATE_TITLE", [message("user", timestamp(2020, 1, 1), ["PRIVATE_TEXT"])])]
+    donations = dict(run_flow(write_export(tmp_path, payload)))
+    assert set(donations) == {"s-tracking", "s-chatgpt-conversations"}
+    tracking = "\n".join(donations["s-tracking"])
+    assert "Extracted 0 ChatGPT messages (1 outside the time window)" in tracking
+    assert "Data donated" in tracking
     assert "PRIVATE" not in tracking

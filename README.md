@@ -68,9 +68,14 @@ that accepts only the observed format and reports anything else ("fail soon"):
 - Only observed encodings are accepted: timestamps as numeric Unix seconds, the
   hidden flag as a boolean (normally absent), titles as strings. Absent model
   or metadata (user messages) is an empty model.
-- The table shows messages from the last twelve calendar months (UTC), newest
-  first. Note: the reference kept export order (conversations in file order,
-  messages in mapping order).
+- The table shows messages from the time window, newest first. The window is
+  `TIME_WINDOW_MONTHS` in `port/script.py`, currently set to **24 calendar months**
+  (UTC) before upload for temporary testing. The CAIS requirement remains 12
+  months; `None` keeps all messages. The window used is recorded in the tracking
+  donation. A test release with another window is a
+  `feature/*` branch that changes only this value (CI builds a release per
+  branch). Note: the reference had no window and kept export order
+  (conversations in file order, messages in mapping order).
 - `packages/python/port/script.py` validates the archive boundary. Current
   exports list their files in `export_manifest.json`; large exports may split
   `conversations.json` into several files, which are read in manifest order,
@@ -89,8 +94,8 @@ Two kinds of failure are handled differently:
   and participants can be asked to donate again.
 - **Unusable single message**: an unknown content type without `parts`, a
   timestamp in the future (device clock), or text that cannot be serialized.
-  Only that message is skipped; extraction continues. If nothing usable remains,
-  the export is rejected with a retry.
+  Only that message is skipped; extraction continues. If skipped messages leave
+  nothing to donate, the export is rejected with a retry.
 
 Both are logged as warnings without titles, text or export IDs. Skipped
 messages are logged as one summary line with counts per reason, e.g.
@@ -104,7 +109,10 @@ line reaches two channels:
   decision, so researchers can account for skipped messages in their analysis.
 
 The consent screen shows only the conversation tables; its donated JSON is
-unchanged. Messages outside the study window are not issues.
+unchanged. Messages outside the time window are not issues. An export with no
+messages in the window still reaches the consent step: a notice explains the
+empty table and the participant donates it, so researchers can tell "no recent
+ChatGPT use" apart from drop-out.
 
 Coverage is in `packages/python/tests/` and `tests/donation.spec.ts`, using
 synthetic fixtures shaped like the real exports. No split export has been
@@ -171,14 +179,19 @@ tables because global newest-first ordering takes precedence.
 
 ### Local extraction debugging (CLI)
 
-You can run the extraction locally against a real zip file — no browser or Pyodide needed:
+Run the extraction locally against a real export, with any time window — no
+browser or Pyodide needed:
 
 ```bash
 cd packages/python
-poetry run python -m port.script path/to/file.zip
+poetry run python -m port.script path/to/export.zip                     # time window
+poetry run python -m port.script path/to/export.zip --window-months 24
+poetry run python -m port.script path/to/export.zip --window-months none
 ```
 
-This drives `extract_tables()` and prints the resulting tables for a valid export.
+It prints the tracking log and counts (messages, conversations, date range),
+never message content. To try another window in the browser, change
+`TIME_WINDOW_MONTHS`; `pnpm run start` rebuilds the wheel on save.
 
 ### Adding Dependencies
 

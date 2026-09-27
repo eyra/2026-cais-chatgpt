@@ -13,15 +13,17 @@
 
 * Changed extraction from the Utrecht reference's recursive substring matching to explicit field parsing. Donated keys, values and local-time formatting are unchanged: verified message-by-message against the unmodified reference on four real exports, including branches, image parts (flattened like the reference) and reasoning messages (rows with an empty message). Similarly named metadata can no longer override roles/models or be appended to message text.
 * Changed parsing to accept only the observed export format: numeric Unix-second timestamps, boolean hidden flags, string titles and known content types.
-* Added fail-soon handling of export format changes: an unknown shape of a field present on every conversation or message rejects the export at its first occurrence, logging the reason code and position. Single unusable messages (unknown content type, future timestamp, unserializable text) are skipped and logged as one summary line with counts per reason; if nothing usable remains, the export is rejected.
+* Added fail-soon handling of export format changes: an unknown shape of a field present on every conversation or message rejects the export at its first occurrence, logging the reason code and position. Single unusable messages (unknown content type, future timestamp, unserializable text) are skipped and logged as one summary line with counts per reason; if skipped messages leave nothing to donate, the export is rejected.
+* Added a configurable time window, `TIME_WINDOW_MONTHS`, currently set to 24 calendar months for temporary testing (CAIS requirement: 12 months; `None` keeps all messages). Participant texts and the tracking log follow the setting; `python -m port.script export.zip --window-months 24` (or `--window-months none`) runs it locally and prints counts only.
+* Changed exports without messages in the time window to still reach the consent step, with a notice explaining the empty table, so the participant donates it instead of ending without a donation.
 * Added the Utrecht reference's tracking donation: the flow log, including rejections and skipped-message summaries, is donated as `<session>-tracking` at every step, whatever the consent decision, and forwarded as `CommandSystemLog` to the host (AppSignal). Logs contain positions and reason codes only, no participant text.
 * Added support for split exports: `conversations.json` files listed in `export_manifest.json` are read in order, one at a time, keeping peak memory to one file.
 * Added archive safeguards: 256 MiB per JSON file, rejection of missing listed files, duplicate JSON keys, unreadable or excessively nested JSON, and text that cannot be serialized.
 * Fixed future-dated timestamps passing the twelve-month filter.
 * Removed `port/helpers.py` (reference fuzzy-matching helpers).
-* Changed study table titles to “Your conversations with ChatGPT” (with German and Dutch equivalents); omitted the title suffix for a single table while retaining part numbers for multiple tables.
+* Changed table titles to “Your conversations with ChatGPT” (with German and Dutch equivalents); omitted the title suffix for a single table while retaining part numbers for multiple tables.
 * Changed the CAIS table to show capitalized column labels (German and Dutch equivalents) and relative column widths: message widest, then conversation title. Uses the upstream display-only `headers` and `column_widths`; donated keys are unchanged.
-* Changed the consent-page introduction to the Utrecht study's wording (English and Dutch verbatim from `port-chatgpt-uu`). The German text is a provisional Eyra translation; replace it with the approved CAIS wording when available.
+* Changed the consent-page introduction to the Utrecht reference's wording (English and Dutch verbatim from `port-chatgpt-uu`). The German text is a provisional Eyra translation; replace it with the approved CAIS wording when available.
 
 ## Unreleased
 

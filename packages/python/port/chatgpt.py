@@ -14,6 +14,7 @@ Two kinds of failure are distinguished:
   continues.
 """
 
+import calendar
 from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -53,12 +54,19 @@ class UnsupportedExportFormat(ValueError):
 class ExtractionResult:
     messages: pd.DataFrame
     issues: pd.DataFrame
+    # Visible messages dated before the window (not parsed further): tells
+    # "nothing recent" apart from "no messages at all" when `messages` is empty.
+    outside_window: int = 0
 
 
 class _FormatChange(Exception):
     def __init__(self, reason: str):
         super().__init__(reason)
         self.reason = reason
+
+
+class _OutsideWindow(Exception):
+    pass
 
 
 class _Skip(Exception):
@@ -139,9 +147,12 @@ def _content_text(content: Any) -> str:
 
 
 def _message_fields(
-    message: Any, current: datetime, cutoff: datetime
+    message: Any, current: datetime, cutoff: datetime | None
 ) -> tuple[datetime, str, str, str, str] | None:
-    """(created, role, text, model, local time), or None if hidden or out of window."""
+    """(created, role, text, model, local time), or None if hidden.
+
+    Raises _OutsideWindow for a message older than the cutoff.
+    """
     if not isinstance(message, dict):
         raise _FormatChange("invalid_message")
     metadata = message.get("metadata")
@@ -154,8 +165,8 @@ def _message_fields(
     created = _timestamp(message.get("create_time"))
     if created > current:
         raise _Skip("future_timestamp")
-    if created < cutoff:
-        return None
+    if cutoff is not None and created < cutoff:
+        raise _OutsideWindow
     author = message.get("author")
     role = author.get("role") if isinstance(author, dict) else None
     if not isinstance(role, str):
@@ -177,28 +188,37 @@ def _message_fields(
     return created, role, text, model, local_time
 
 
-def extract_conversations(
-    conversations: Iterable[Any], now: datetime | None = None
-) -> ExtractionResult:
-    """Keep the last UTC calendar year, newest first.
+def months_before(value: datetime, months: int) -> datetime:
+    """Same day and time `months` calendar months earlier, clamped to month end."""
+    year, month = divmod(value.year * 12 + value.month - 1 - months, 12)
+    day = min(value.day, calendar.monthrange(year, month + 1)[1])
+    return value.replace(year=year, month=month + 1, day=day)
 
-    Raises UnsupportedExportFormat at the first format change. Skipped messages
-    are returned as issues. Locations are 1-based positions across the whole
-    export (all parts), never export IDs or participant text. Conversations are
-    consumed once, in order, so a lazy iterable keeps only the current export
-    part in memory. Hidden messages and ordinary root placeholders are
-    intentionally skipped. Naive clocks are interpreted as UTC; aware clocks are
-    normalized to UTC.
+
+def extract_conversations(
+    conversations: Iterable[Any],
+    now: datetime | None = None,
+    window_months: int | None = None,
+) -> ExtractionResult:
+    """Keep messages from the last `window_months` calendar months (UTC), newest first.
+
+    window_months=None keeps all messages. Raises UnsupportedExportFormat at the
+    first format change. Skipped messages are returned as issues. Locations are
+    1-based positions across the whole export (all parts), never export IDs or
+    participant text. Conversations are consumed once, in order, so a lazy
+    iterable keeps only the current export part in memory. Hidden messages and
+    ordinary root placeholders are intentionally skipped. Naive clocks are
+    interpreted as UTC; aware clocks are normalized to UTC.
     """
+    if window_months is not None and (isinstance(window_months, bool) or window_months < 1):
+        raise ValueError(f"window_months must be a positive number of months or None, got {window_months!r}")
     if now is None:
         now = datetime.now(timezone.utc)
     current = now.replace(tzinfo=timezone.utc) if now.tzinfo is None else now.astimezone(timezone.utc)
-    try:
-        cutoff = current.replace(year=current.year - 1)
-    except ValueError:
-        cutoff = current.replace(year=current.year - 1, day=28)
+    cutoff = None if window_months is None else months_before(current, window_months)
     rows = []
     issues = []
+    outside_window = 0
 
     def issue(conversation: int, message: int | None, reason: str) -> None:
         issues.append({
@@ -235,6 +255,9 @@ def extract_conversations(
             except _Skip as error:
                 issue(conversation_position, message_position, error.reason)
                 continue
+            except _OutsideWindow:
+                outside_window += 1
+                continue
             if fields is None:
                 continue
             created, role, text, model, local_time = fields
@@ -251,4 +274,5 @@ def extract_conversations(
     return ExtractionResult(
         messages=pd.DataFrame([row for _, row in rows], columns=[*MESSAGE_COLUMNS, "_conversation"]),
         issues=pd.DataFrame(issues, columns=ISSUE_COLUMNS, dtype=str),
+        outside_window=outside_window,
     )
