@@ -129,6 +129,7 @@ async function submitDonation(page: Page, donations: Donation[]): Promise<Submit
 test('reviews and submits visible ChatGPT messages from the export', async ({ page }) => {
   const donations = await uploadChatGPTExport(page);
 
+  await expect(page.getByText('Messages from the last 12 months, newest first.', { exact: true })).toBeVisible();
   const table = page.getByTestId('table-chatgpt_conversations_1');
   // Labels are display-only: donated keys below stay lowercase.
   await expect(table.getByRole('columnheader', { name: 'Message', exact: true })).toBeVisible();
