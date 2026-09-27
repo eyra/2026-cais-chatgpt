@@ -57,40 +57,34 @@ const questionRow = {
   message: 'Participant question', model: '', time: localTime(questionTimestamp),
 };
 
-function messageNode(text: string, timestamp: unknown) {
+function messageNode(text: string, timestamp: unknown, content: unknown = { parts: [text] }) {
   return {
     message: {
       author: { role: 'assistant' }, create_time: timestamp,
-      content: { parts: [text] }, metadata: { model_slug: 'gpt-5' },
+      content, metadata: { model_slug: 'gpt-5' },
     },
   };
 }
 
-const failedText = 'SECRET invalid timestamp message';
-const failedTitle = 'SECRET invalid conversation title';
-const failedMappingText = 'SECRET invalid mapping text';
-const invalidConversation = { title: failedTitle, mapping: [failedMappingText] };
-const invalidMessageIssue = {
-  conversation: '1', message: '2', reason: 'invalid_timestamp', action: 'message_excluded',
-};
-const invalidConversationIssue = {
-  conversation: '2', message: '', reason: 'invalid_mapping', action: 'conversation_excluded',
-};
+const secretText = 'SECRET skipped message';
+const secretTitle = 'SECRET conversation title';
 
-const mixedConversations: unknown[] = [
-  {
-    title: 'Research conversation',
-    mapping: {
-      valid: messageNode('Newest answer', newestTimestamp),
-      invalid: messageNode(failedText, 'not a timestamp'),
-    },
-  },
-  invalidConversation,
-];
+interface Donation {
+  key: string;
+  data: string;
+}
 
-async function openDonation(page: Page): Promise<void> {
+// Records every donation, including the "<session>-tracking" log donations
+// sent throughout the flow. Registered before the app loads.
+async function openDonation(page: Page): Promise<Donation[]> {
+  const donations: Donation[] = [];
+  await page.route('/data-submission', async route => {
+    donations.push(JSON.parse(route.request().postData()!));
+    await route.fulfill({ json: { ok: true } });
+  });
   await page.goto('http://localhost:3000/');
   await expect(page.getByRole('heading', { name: 'Your ChatGPT data' })).toBeVisible({ timeout: 90000 });
+  return donations;
 }
 
 async function chooseExport(page: Page, file: ExportFile): Promise<void> {
@@ -101,36 +95,39 @@ async function chooseExport(page: Page, file: ExportFile): Promise<void> {
   await page.getByText('Continue').click();
 }
 
-async function uploadChatGPTExport(page: Page, conversations = fixtureConversations): Promise<void> {
-  await openDonation(page);
+async function uploadChatGPTExport(page: Page, conversations = fixtureConversations): Promise<Donation[]> {
+  const donations = await openDonation(page);
   await chooseExport(page, exportFile(conversations));
   await expect(page.getByTestId('table-chatgpt_conversations_1')).toBeVisible();
+  return donations;
 }
 
-function captureDonation(page: Page): Promise<string | null> {
-  const { promise, resolve } = Promise.withResolvers<string | null>();
-  page.route('/data-submission', async route => {
-    await route.fulfill({ json: { ok: true } });
-    resolve(route.request().postData());
-  });
-  return promise;
+function latestTracking(donations: Donation[]): string {
+  const tracking = donations.filter(donation => donation.key.endsWith('-tracking')).at(-1);
+  return tracking ? (JSON.parse(tracking.data) as string[]).join('\n') : '';
 }
 
-function donatedTables(submittedData: string): Record<string, { data: Record<string, string>[] }> {
-  const request = JSON.parse(submittedData);
-  return JSON.parse(request.data);
+interface Submitted {
+  tables: Record<string, { data: Record<string, string>[] }>;
+  tracking: string;
+  raw: string;
 }
 
-async function submitDonation(page: Page): Promise<string> {
-  const donation = captureDonation(page);
+async function submitDonation(page: Page, donations: Donation[]): Promise<Submitted> {
   await page.getByText('Yes, donate', { exact: true }).click();
-  const submittedData = await donation;
-  expect(submittedData).not.toBeNull();
-  return submittedData!;
+  // The flow donates the conversations, then the final tracking log.
+  await expect.poll(() => latestTracking(donations)).toContain('Data donated');
+  const conversations = donations.filter(donation => donation.key.endsWith('-chatgpt-conversations'));
+  expect(conversations).toHaveLength(1);
+  return {
+    tables: JSON.parse(conversations[0].data),
+    tracking: latestTracking(donations),
+    raw: JSON.stringify(donations),
+  };
 }
 
 test('reviews and submits visible ChatGPT messages from the export', async ({ page }) => {
-  await uploadChatGPTExport(page);
+  const donations = await uploadChatGPTExport(page);
 
   const table = page.getByTestId('table-chatgpt_conversations_1');
   // Labels are display-only: donated keys below stay lowercase.
@@ -138,15 +135,16 @@ test('reviews and submits visible ChatGPT messages from the export', async ({ pa
   await expect(table.getByText('Newest answer')).toBeVisible();
   await expect(table.getByText('Participant question')).toBeVisible();
   await expect(table.getByText('Hidden answer')).not.toBeVisible();
-  await expect(page.getByTestId('table-chatgpt_processing_issues_1')).not.toBeVisible();
 
-  const tables = donatedTables(await submitDonation(page));
+  const { tables, tracking } = await submitDonation(page, donations);
   expect(Object.keys(tables)).toEqual(['chatgpt_conversations_1']);
   expect(tables.chatgpt_conversations_1.data).toEqual([newestRow, questionRow]);
+  expect(tracking).toContain('Extracted 2 ChatGPT messages with 0 processing issue(s)');
+  expect(tracking).not.toContain('Processing issues');
 });
 
 test('removes selected ChatGPT messages before donation', async ({ page }) => {
-  await uploadChatGPTExport(page);
+  const donations = await uploadChatGPTExport(page);
 
   await page.getByRole('checkbox').first().click();
   const table = page.getByTestId('table-chatgpt_conversations_1');
@@ -154,87 +152,50 @@ test('removes selected ChatGPT messages before donation', async ({ page }) => {
   await page.getByText('Delete selected').first().click();
   await expect(table.getByText('Newest answer')).not.toBeVisible();
 
-  const tables = donatedTables(await submitDonation(page));
+  const { tables } = await submitDonation(page, donations);
   expect(tables.chatgpt_conversations_1.data).toEqual([questionRow]);
 });
 
-test('reviews and donates privacy-safe processing issues alongside retained messages', async ({ page }) => {
-  await uploadChatGPTExport(page, mixedConversations);
-
-  const issues = page.getByTestId('table-chatgpt_processing_issues_1');
-  await expect(issues).toBeVisible();
-  await expect(issues.getByText('invalid_timestamp', { exact: true })).toBeVisible();
-  await expect(issues.getByText('invalid_mapping', { exact: true })).toBeVisible();
-  for (const secret of [failedText, failedTitle, failedMappingText]) {
-    await expect(page.getByText(secret, { exact: true })).not.toBeVisible();
-  }
-
-  const submittedData = await submitDonation(page);
-  const tables = donatedTables(submittedData);
-  expect(Object.keys(tables).sort()).toEqual(['chatgpt_conversations_1', 'chatgpt_processing_issues_1']);
-  expect(tables.chatgpt_conversations_1.data).toEqual([newestRow]);
-  expect(tables.chatgpt_processing_issues_1.data).toEqual([invalidMessageIssue, invalidConversationIssue]);
-  for (const secret of [failedText, failedTitle, failedMappingText]) {
-    expect(submittedData).not.toContain(secret);
-  }
-});
-
-test('lets participants remove processing issue rows before donation', async ({ page }) => {
-  await uploadChatGPTExport(page, mixedConversations);
-
-  const issues = page.getByTestId('table-chatgpt_processing_issues_1');
-  await expect(issues).toBeVisible();
-  // Before editing there is one Adjust checkbox per table.
-  await page.getByRole('checkbox').nth(1).click();
-  await issues.getByRole('checkbox').nth(1).click();
-  await page.getByText('Delete selected', { exact: true }).nth(1).click();
-  await expect(issues.getByText('invalid_timestamp', { exact: true })).not.toBeVisible();
-  await expect(issues.getByText('invalid_mapping', { exact: true })).toBeVisible();
-
-  const tables = donatedTables(await submitDonation(page));
-  expect(tables.chatgpt_conversations_1.data).toEqual([newestRow]);
-  expect(tables.chatgpt_processing_issues_1.data).toEqual([invalidConversationIssue]);
-});
-
-test('excludes future messages and donates their processing issue', async ({ page }) => {
-  const futureText = 'SECRET future message';
-  await uploadChatGPTExport(page, [{
-    title: 'Research conversation',
+test('skips unusable messages and reports them only in the tracking donation', async ({ page }) => {
+  const donations = await uploadChatGPTExport(page, [{
+    title: secretTitle,
     mapping: {
       valid: messageNode('Newest answer', newestTimestamp),
-      future: messageNode(futureText, (referenceDay + 7 * day) / 1000),
+      canvas: messageNode(secretText, newestTimestamp, { content_type: 'canvas', text: secretText }),
+      future: messageNode(secretText, (referenceDay + 7 * day) / 1000),
     },
   }]);
 
-  const issues = page.getByTestId('table-chatgpt_processing_issues_1');
-  await expect(issues.getByText('future_timestamp', { exact: true })).toBeVisible();
-  const submittedData = await submitDonation(page);
-  const tables = donatedTables(submittedData);
-  expect(tables.chatgpt_conversations_1.data).toEqual([newestRow]);
-  expect(tables.chatgpt_processing_issues_1.data).toEqual([{
-    conversation: '1', message: '2', reason: 'future_timestamp', action: 'message_excluded',
-  }]);
-  expect(submittedData).not.toContain(futureText);
+  await expect(page.getByTestId('table-chatgpt_processing_issues_1')).not.toBeVisible();
+  await expect(page.getByText(secretText)).not.toBeVisible();
+
+  const { tables, tracking, raw } = await submitDonation(page, donations);
+  expect(Object.keys(tables)).toEqual(['chatgpt_conversations_1']);
+  expect(tables.chatgpt_conversations_1.data).toEqual([{ ...newestRow, 'conversation title': secretTitle }]);
+  expect(tracking).toContain('Processing issues: ');
+  expect(tracking).toContain('unknown_content_type:canvas message_excluded=1');
+  expect(tracking).toContain('future_timestamp message_excluded=1');
+  expect(raw).not.toContain(secretText);
 });
 
-test('offers retry rather than issues-only donation when every record fails', async ({ page }) => {
-  await openDonation(page);
+test('rejects a changed export format at once and tracks the reason', async ({ page }) => {
+  const donations = await openDonation(page);
   await chooseExport(page, exportFile([
-    {
-      title: failedTitle,
-      mapping: { invalid: messageNode(failedText, 'not a timestamp') },
-    },
-    invalidConversation,
+    { title: secretTitle, mapping: { valid: messageNode('Newest answer', newestTimestamp) } },
+    { title: secretTitle, mapping: { changed: messageNode(secretText, '2026-09-20T12:00:00Z') } },
   ]));
 
   await expect(page.getByRole('button', { name: 'Try again' })).toBeVisible();
   await expect(page.getByText('Yes, donate', { exact: true })).not.toBeVisible();
-  await expect(page.getByTestId('table-chatgpt_processing_issues_1')).not.toBeVisible();
+  await expect.poll(() => latestTracking(donations))
+    .toContain('unsupported format, reason=invalid_timestamp conversation=2 message=1');
+  expect(JSON.stringify(donations)).not.toContain('SECRET');
+
   await page.getByRole('button', { name: 'Try again' }).click();
   await chooseExport(page, exportFile(fixtureConversations));
   await expect(page.getByTestId('table-chatgpt_conversations_1')).toBeVisible();
 
-  const tables = donatedTables(await submitDonation(page));
+  const { tables } = await submitDonation(page, donations);
   expect(Object.keys(tables)).toEqual(['chatgpt_conversations_1']);
   expect(tables.chatgpt_conversations_1.data).toEqual([newestRow, questionRow]);
 });

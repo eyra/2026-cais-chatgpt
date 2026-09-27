@@ -3,8 +3,9 @@
 from datetime import datetime, timezone
 import json
 from pathlib import Path
+import subprocess
 import sys
-from types import SimpleNamespace
+import textwrap
 import zipfile
 
 import pandas as pd
@@ -13,8 +14,6 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from port import chatgpt, script
-from port.api.commands import FlushLogs
-from port.api.props import PropsUIPromptConsentFormTable
 
 NOW = datetime(2026, 9, 21, 12, 0, tzinfo=timezone.utc)
 
@@ -109,17 +108,19 @@ def test_split_export_yields_all_parts_in_manifest_order(tmp_path, prefix):
 
 
 def test_split_export_issue_positions_continue_across_parts(tmp_path):
+    canvas = message("user", timestamp(2026, 9, 20), [])
+    canvas["message"]["content"] = {"content_type": "canvas", "text": "private"}
     path = write_split_export(
         tmp_path,
         {
             "c-0.json": [conversation("Valid", [message("user", timestamp(2026, 9, 20), ["Kept"])])],
-            "c-1.json": [{"title": "Broken", "mapping": None}],
+            "c-1.json": [conversation("Canvas", [canvas])],
         },
         ["c-0.json", "c-1.json"],
     )
     extraction = chatgpt.extract_conversations(script.iter_conversations(path), now=NOW)
     assert extraction.messages["message"].tolist() == ["Kept"]
-    assert extraction.issues[["conversation", "reason"]].values.tolist() == [["2", "invalid_mapping"]]
+    assert extraction.issues[["conversation", "reason"]].values.tolist() == [["2", "unknown_content_type:canvas"]]
 
 
 def test_split_export_parses_one_part_at_a_time(tmp_path, monkeypatch):
@@ -295,71 +296,111 @@ def test_compressed_json_size_is_bounded_before_parsing(tmp_path, monkeypatch):
         load(path)
 
 
-def test_partial_export_retains_valid_messages_and_reports_failures(tmp_path, caplog):
+def canvas_message(created_at: float) -> dict:
+    unusable = message("user", created_at, [])
+    unusable["message"]["content"] = {"content_type": "canvas", "text": "PRIVATE_TEXT"}
+    return unusable
+
+
+def test_partial_export_keeps_valid_messages_and_logs_one_summary(tmp_path, caplog):
     payload = [
         conversation("Valid", [message("user", timestamp(2026, 9, 20), ["Kept"])]),
-        {"title": "PRIVATE_TITLE", "mapping": None},
-        conversation("PRIVATE_TITLE", [message("user", None, ["PRIVATE_TEXT"])]),
+        conversation("PRIVATE_TITLE", [canvas_message(timestamp(2026, 9, 19)), canvas_message(timestamp(2026, 9, 18))]),
+        conversation("PRIVATE_TITLE", [message("user", timestamp(2026, 9, 22), ["PRIVATE_TEXT"])]),
     ]
-    generator = script.extract_export(write_export(tmp_path, payload), now=NOW)
-    with caplog.at_level("WARNING"):
-        assert next(generator) == FlushLogs
-    with pytest.raises(StopIteration) as finished:
-        next(generator)
-    extraction, retry = finished.value.value
-    assert retry is False
+    with caplog.at_level("WARNING", logger="port.script"):
+        extraction, no_usable_messages = script.extract_export(write_export(tmp_path, payload), now=NOW)
+    assert no_usable_messages is False
     assert extraction.messages["message"].tolist() == ["Kept"]
-    assert extraction.issues.to_dict("records") == [
-        {"conversation": "2", "message": "", "reason": "invalid_mapping", "action": "conversation_excluded"},
-        {"conversation": "3", "message": "1", "reason": "invalid_timestamp", "action": "message_excluded"},
+    warnings = [record.getMessage() for record in caplog.records if record.name == "port.script"]
+    assert warnings == [
+        "Processing issues: unknown_content_type:canvas message_excluded=2, future_timestamp message_excluded=1"
     ]
-    assert "invalid_mapping" in caplog.text
-    assert "invalid_timestamp" in caplog.text
+
+
+def test_format_change_rejects_export_and_logs_its_position(tmp_path, caplog):
+    payload = [
+        conversation("Valid", [message("user", timestamp(2026, 9, 20), ["Kept"])]),
+        conversation("PRIVATE_TITLE", [message("user", "2026-09-20T12:00:00Z", ["PRIVATE_TEXT"])]),
+    ]
+    with caplog.at_level("WARNING", logger="port.script"):
+        assert script.extract_export(write_export(tmp_path, payload), now=NOW) == (None, False)
+    assert caplog.records[-1].getMessage() == (
+        "Rejected ChatGPT export: unsupported format, reason=invalid_timestamp conversation=2 message=1"
+    )
     assert "PRIVATE" not in caplog.text
 
 
-def test_all_failed_export_offers_retry_instead_of_empty_consent(tmp_path):
-    payload = [conversation("Failed", [message("user", None, ["Private"])])]
-    generator = script.extract_export(write_export(tmp_path, payload), now=NOW)
-    assert next(generator) == FlushLogs
-    retry_page = next(generator).toDict()
-    assert retry_page["page"]["body"][0]["__type__"] == "PropsUIPromptConfirm"
-    with pytest.raises(StopIteration) as finished:
-        generator.send(SimpleNamespace(__type__="PayloadTrue"))
-    assert finished.value.value == (None, True)
+def test_export_with_only_skipped_messages_is_rejected(tmp_path):
+    payload = [conversation("Failed", [canvas_message(timestamp(2026, 9, 20))])]
+    assert script.extract_export(write_export(tmp_path, payload), now=NOW) == (None, True)
 
 
 def test_old_messages_are_not_reported_as_parsing_failures(tmp_path):
     payload = [conversation("Old", [message("user", timestamp(2020, 1, 1), ["Old"])])]
-    generator = script.extract_export(write_export(tmp_path, payload), now=NOW)
-    assert next(generator) == FlushLogs
-    with pytest.raises(StopIteration) as finished:
-        next(generator)
-    extraction, retry = finished.value.value
-    assert retry is False
+    extraction, no_usable_messages = script.extract_export(write_export(tmp_path, payload), now=NOW)
+    assert no_usable_messages is False
     assert extraction.messages.empty
     assert extraction.issues.empty
 
 
-def test_review_serialization_preserves_all_issues_across_table_limit():
-    issues = pd.DataFrame(
-        [
-            {"conversation": str(index), "message": "", "reason": "invalid_mapping", "action": "conversation_excluded"}
-            for index in range(1, 10_002)
-        ]
+FLOW = textwrap.dedent("""
+    import json, sys
+    from types import SimpleNamespace
+    from port import script
+    from port.api.commands import CommandSystemDonate
+
+    answers = {
+        "PropsUIPromptFileInput": SimpleNamespace(__type__="PayloadFile", value=sys.argv[1]),
+        "PropsUIPromptConfirm": SimpleNamespace(__type__="PayloadFalse", value=None),
+        "PropsUIDataSubmissionButtons": SimpleNamespace(__type__=sys.argv[2], value="{}"),
+    }
+    flow = script.process({"sessionId": "s"})
+    donations = []
+    try:
+        command = next(flow)
+        while True:
+            if isinstance(command, CommandSystemDonate):
+                donations.append((command.key, command.json_string))
+                command = flow.send(None)
+            else:
+                body = command.toDict()["page"]["body"]
+                command = flow.send(answers[body[-1]["__type__"]])
+    except StopIteration:
+        pass
+    print(json.dumps(donations))
+""")
+
+
+def run_flow(path: Path, consent: str = "PayloadJSON") -> list[tuple[str, object]]:
+    """Drive process() in a fresh interpreter, as in Pyodide: no host logging setup."""
+    completed = subprocess.run(
+        [sys.executable, "-c", FLOW, str(path), consent],
+        cwd=Path(__file__).parent.parent, capture_output=True, text=True, check=True,
     )
-    extraction = chatgpt.ExtractionResult(messages=make_frame([0]), issues=issues)
-    tables = [
-        item.toDict()
-        for item in script.prompt_consent(extraction)
-        if isinstance(item, PropsUIPromptConsentFormTable)
+    return [(key, json.loads(value)) for key, value in json.loads(completed.stdout)]
+
+
+@pytest.mark.parametrize("consent", ["PayloadJSON", "PayloadFalse"])
+def test_tracking_is_donated_whatever_the_consent_decision(tmp_path, consent):
+    payload = [
+        conversation("Valid", [message("user", datetime.now(timezone.utc).timestamp() - 60, ["Kept"])]),
+        conversation("PRIVATE_TITLE", [canvas_message(datetime.now(timezone.utc).timestamp() - 60)]),
     ]
-    assert [table["id"] for table in tables] == [
-        "chatgpt_conversations_1", "chatgpt_processing_issues_1", "chatgpt_processing_issues_2"
-    ]
-    assert list(json.loads(tables[0]["data_frame"])) == script.MESSAGE_COLUMNS
-    reported = [json.loads(table["data_frame"]) for table in tables[1:]]
-    assert [len(table["conversation"]) for table in reported] == [10_000, 1]
-    assert [
-        value for table in reported for value in table["conversation"].values()
-    ] == issues["conversation"].tolist()
+    donations = run_flow(write_export(tmp_path, payload), consent)
+    assert [key for key, _ in donations if key != "s-tracking"] == ["s-chatgpt-conversations"]
+    assert donations[-1][0] == "s-tracking"
+    tracking = "\n".join(donations[-1][1])
+    assert "Processing issues: unknown_content_type:canvas message_excluded=1" in tracking
+    assert ("Data donated" if consent == "PayloadJSON" else "Data submission declined") in tracking
+    assert "PRIVATE" not in tracking
+
+
+def test_tracking_records_a_format_change_rejection(tmp_path):
+    payload = [conversation("PRIVATE_TITLE", [message("user", "2026-09-20T12:00:00Z", ["PRIVATE_TEXT"])])]
+    donations = run_flow(write_export(tmp_path, payload))
+    assert {key for key, _ in donations} == {"s-tracking"}
+    tracking = "\n".join(donations[-1][1])
+    assert "unsupported format, reason=invalid_timestamp conversation=1 message=1" in tracking
+    assert "Skipped during retry flow" in tracking
+    assert "PRIVATE" not in tracking

@@ -179,11 +179,19 @@ def test_false_hidden_flags_keep_messages(flag):
     ({"title": "t", "mapping": None}, "invalid_mapping"),
     ({"title": "t"}, "invalid_mapping"),
 ])
-def test_bad_conversation_cannot_discard_later_valid_conversation(bad, reason):
-    result = extract(bad, conversation())
-    assert result.messages["message"].tolist() == ["Hello world"]
-    assert result.messages["_conversation"].tolist() == [1]
-    assert result.issues.to_dict("records") == [{"conversation": "1", "message": "", "reason": reason, "action": "conversation_excluded"}]
+def test_conversation_format_change_rejects_export_at_first_occurrence(bad, reason):
+    consumed = []
+
+    def export():
+        for item in (conversation(), bad, conversation()):
+            consumed.append(item)
+            yield item
+
+    with pytest.raises(chatgpt.UnsupportedExportFormat) as raised:
+        chatgpt.extract_conversations(export(), now=NOW)
+    assert (raised.value.reason, raised.value.conversation, raised.value.message) == (reason, 2, None)
+    # Fail soon: nothing after the format change is parsed.
+    assert len(consumed) == 2
 
 
 @pytest.mark.parametrize("bad, reason", [
@@ -194,21 +202,30 @@ def test_bad_conversation_cannot_discard_later_valid_conversation(bad, reason):
     # Only booleans have been observed; other encodings are not guessed.
     (node(metadata={"is_visually_hidden_from_conversation": "true"}), "invalid_hidden_flag"),
     (node(metadata={"is_visually_hidden_from_conversation": 1}), "invalid_hidden_flag"),
-    (node(metadata={"is_visually_hidden_from_conversation": []}), "invalid_hidden_flag"),
     (node(author=None), "invalid_role"),
     (node(author={"role": None}), "invalid_role"),
-    (node(author={"role": ""}), "invalid_role"), (node(author={"role": 7}), "invalid_role"),
+    (node(author={"role": 7}), "invalid_role"),
     (node(metadata={"model_slug": []}), "invalid_model"),
     (node(content=None), "invalid_content"),
-    (node(content={}), "invalid_content"), (node(content={"parts": None, "text": "not a fallback"}), "invalid_content"),
     (node(content={"parts": "not a list"}), "invalid_content"),
-    (node(content={"text": 7}), "invalid_content"),
-    # Unknown content types without parts are reported, not donated empty.
-    (node(content={"content_type": "code", "text": "print(1)"}), "invalid_content"),
     (node(content={"parts": ["valid prefix", float("nan")]}), "invalid_content"),
+    (node(create_time="2026-01-15T12:00:00Z"), "invalid_timestamp"),
 ])
-def test_invalid_message_is_reported_without_partial_text_or_losing_sibling(bad, reason):
-    result = extract(conversation({"bad": bad, "valid": node()}))
+def test_message_format_change_rejects_export_with_position_only(bad, reason):
+    with pytest.raises(chatgpt.UnsupportedExportFormat) as raised:
+        extract(conversation({"valid": node(), "bad": bad}))
+    assert (raised.value.reason, raised.value.conversation, raised.value.message) == (reason, 1, 2)
+    assert "private" not in str(raised.value)
+
+
+@pytest.mark.parametrize("content, reason", [
+    ({"content_type": "canvas", "text": "private"}, "unknown_content_type:canvas"),
+    ({"text": "private"}, "unknown_content_type:other"),
+    ({"content_type": "private free text!", "text": "x"}, "unknown_content_type:other"),
+    ({"parts": ["private\ud800value"]}, "invalid_text"),
+])
+def test_unusable_message_is_skipped_and_reported_without_losing_siblings(content, reason):
+    result = extract(conversation({"bad": node(content=content), "valid": node()}))
     assert result.messages["message"].tolist() == ["Hello world"]
     assert result.issues.to_dict("records") == [{"conversation": "1", "message": "1", "reason": reason, "action": "message_excluded"}]
 
@@ -225,10 +242,10 @@ def test_numeric_unix_seconds_are_the_supported_timestamp(timestamp, local_zone)
     None, True, {}, "", str(CREATED), CREATED * 1000, "2026-01-15T12:00:00Z",
     float("nan"), float("inf"), float("-inf"), 1e30, -(10**400),
 ])
-def test_invalid_timestamps_are_issues_not_silently_filtered(timestamp):
-    result = extract(conversation({"bad": node(create_time=timestamp), "valid": node()}))
-    assert result.messages["message"].tolist() == ["Hello world"]
-    assert result.issues["reason"].tolist() == ["invalid_timestamp"]
+def test_unobserved_timestamp_encodings_are_format_changes(timestamp):
+    with pytest.raises(chatgpt.UnsupportedExportFormat) as raised:
+        extract(conversation({"bad": node(create_time=timestamp)}))
+    assert raised.value.reason == "invalid_timestamp"
 
 
 @pytest.mark.parametrize("now", [NOW, NOW.replace(tzinfo=None), NOW.astimezone(timezone(timedelta(hours=5, minutes=30)))])
@@ -253,35 +270,33 @@ def test_leap_day_cutoff_falls_back_to_february_28_with_same_utc_time():
     assert result.issues.empty
 
 
-def test_depth_limit_rejects_whole_content_not_only_the_deep_leaf():
+def test_depth_limit_is_a_format_change_not_partial_text():
     leaf = "at boundary"
     for _ in range(63):
         leaf = {"child": leaf}
-    valid = node(content={"parts": [leaf]})
-    invalid = node(content={"parts": ["must not retain prefix", [leaf]]})
-    result = extract(conversation({"valid": valid, "invalid": invalid}))
-    assert result.messages["message"].tolist() == ["at boundary"]
-    assert result.issues.to_dict("records") == [{"conversation": "1", "message": "2", "reason": "invalid_content", "action": "message_excluded"}]
+    assert extract(conversation({"valid": node(content={"parts": [leaf]})})).messages["message"].tolist() == ["at boundary"]
+    with pytest.raises(chatgpt.UnsupportedExportFormat):
+        extract(conversation({"invalid": node(content={"parts": ["prefix", [leaf]]})}))
 
 
 def test_issue_locations_are_input_positions_and_never_contain_private_data(capsys, caplog):
     private = "private person title id message content"
     source = conversation({
         private: {"message": None},
-        "bad timestamp " + private: node(create_time=private, content={"parts": [private]}),
-        "bad content " + private: node(content={"parts": [private, float("inf")]}),
+        "future " + private: node(create_time=NOW.timestamp() + 60, content={"parts": [private]}),
+        "canvas " + private: node(content={"content_type": "canvas", "text": private}),
         "valid": node(),
     }, title=private)
-    result = extract(source, {"title": private, "mapping": private})
+    result = extract(source, conversation(title="private\ud800title"))
     assert result.messages["message"].tolist() == ["Hello world"]
     assert result.issues.to_dict("records") == [
-        {"conversation": "1", "message": "2", "reason": "invalid_timestamp", "action": "message_excluded"},
-        {"conversation": "1", "message": "3", "reason": "invalid_content", "action": "message_excluded"},
-        {"conversation": "2", "message": "", "reason": "invalid_mapping", "action": "conversation_excluded"},
+        {"conversation": "1", "message": "2", "reason": "future_timestamp", "action": "message_excluded"},
+        {"conversation": "1", "message": "3", "reason": "unknown_content_type:canvas", "action": "message_excluded"},
+        {"conversation": "2", "message": "", "reason": "invalid_text", "action": "conversation_excluded"},
     ]
-    assert private not in result.issues.to_json()
+    assert "private" not in result.issues.to_json()
     captured = capsys.readouterr()
-    assert private not in captured.out + captured.err + caplog.text
+    assert "private" not in captured.out + captured.err + caplog.text
 
 
 def test_extraction_does_not_mutate_the_export():
@@ -291,11 +306,8 @@ def test_extraction_does_not_mutate_the_export():
     assert source == original
 
 
-@pytest.mark.parametrize("field, reason", [
-    ("title", "invalid_title"), ("role", "invalid_role"),
-    ("model", "invalid_model"), ("parts", "invalid_content"),
-])
-def test_invalid_unicode_is_reported_before_it_can_break_donation_json(field, reason):
+@pytest.mark.parametrize("field", ["title", "role", "model", "parts"])
+def test_invalid_unicode_is_reported_before_it_can_break_donation_json(field):
     bad = conversation()
     message = bad["mapping"]["turn"]["message"]
     invalid = "private\ud800value"
@@ -309,7 +321,7 @@ def test_invalid_unicode_is_reported_before_it_can_break_donation_json(field, re
         message["content"] = {"parts": [invalid]}
     good = conversation({"turn": node(content={"parts": ["Exact text 😀 citeturn1"]})})
     result = extract(bad, good)
-    assert result.issues["reason"].tolist() == [reason]
+    assert result.issues["reason"].tolist() == ["invalid_text"]
     donated = json.loads(result.messages[chatgpt.MESSAGE_COLUMNS].to_json(orient="records"))
     assert [row["message"] for row in donated] == ["Exact text 😀 citeturn1"]
 

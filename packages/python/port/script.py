@@ -2,8 +2,9 @@
 
 Explicit ChatGPT parsing lives in port.chatgpt. This module handles bounded,
 part-by-part archive loading, lossless review-table partitioning and the
-Feldspar consent flow, including a donated report of records that could not be
-processed.
+Feldspar consent flow. As in the Utrecht reference, the flow log (including
+records that could not be processed) is donated as "<session>-tracking" and
+forwarded to the host as CommandSystemLog.
 """
 
 from __future__ import annotations
@@ -11,6 +12,7 @@ from __future__ import annotations
 from collections.abc import Generator, Iterator
 from datetime import datetime
 from pathlib import PurePosixPath
+import io
 import json
 import logging
 from typing import Any
@@ -21,8 +23,19 @@ import pandas as pd
 
 import port.api.props as props
 from port import chatgpt
-from port.api.commands import CommandSystemDonate, CommandUIRender, FlushLogs
+from port.api.commands import CommandSystemDonate, CommandUIRender
 from port.chatgpt import MESSAGE_COLUMNS
+
+LOG_STREAM = io.StringIO()
+
+# Reference tracking setup (port-chatgpt-uu script.py): every log record is
+# kept in LOG_STREAM and donated by donate_logs().
+logging.basicConfig(
+    stream=LOG_STREAM,
+    level=logging.INFO,
+    format="%(asctime)s --- %(name)s --- %(levelname)s --- %(message)s",
+    datefmt="%Y-%m-%dT%H:%M:%S%z",
+)
 
 logger = logging.getLogger(__name__)
 
@@ -40,56 +53,81 @@ class InvalidChatGPTExport(ValueError):
 
 def process(data: dict[str, str]) -> Generator:
     session_id = data.get("sessionId", "")
-    extraction: chatgpt.ExtractionResult | None = None
+    tracking_key = f"{session_id}-tracking"
+    logger.info("Starting the donation flow")
+    yield donate_logs(tracking_key)
 
     while True:
+        logger.info("Prompt for file")
+        yield donate_logs(tracking_key)
         file_result = yield render_data_submission_page([prompt_file()])
         if file_result.__type__ != "PayloadFile":
+            logger.info("Skipped at file selection ending flow")
+            yield donate_logs(tracking_key)
             return
 
-        extraction, retry = yield from extract_export(file_result.value)
-        if retry:
-            continue
-        break
+        extraction, no_usable_messages = extract_export(file_result.value)
+        yield donate_logs(tracking_key)
+        if extraction is not None:
+            break
 
-    if extraction is None:
-        return
+        retry_result = yield render_data_submission_page(
+            [retry_confirmation(no_usable_messages)]
+        )
+        if retry_result.__type__ != "PayloadTrue":
+            logger.info("Skipped during retry flow")
+            yield donate_logs(tracking_key)
+            return
 
+    logger.info("Prompt consent")
+    yield donate_logs(tracking_key)
     result = yield render_data_submission_page(prompt_consent(extraction))
     if result.__type__ == "PayloadJSON":
+        logger.info("Data donated")
         yield donate(f"{session_id}-chatgpt-conversations", result.value)
     elif result.__type__ == "PayloadFalse":
+        logger.info("Data submission declined")
         yield donate(
             f"{session_id}-chatgpt-conversations",
             json.dumps({"status": "data_submission declined"}),
         )
+    yield donate_logs(tracking_key)
 
 
 def extract_export(
     path: Any, now: datetime | None = None
-) -> Generator[object, None, tuple[chatgpt.ExtractionResult | None, bool]]:
-    no_usable_messages = False
+) -> tuple[chatgpt.ExtractionResult | None, bool]:
+    """Return the extraction, or None and whether processing failures left no messages.
+
+    Rejections, format changes and skipped messages are logged as warnings, so
+    they reach both the tracking donation (researchers) and the host log
+    (AppSignal). Skipped messages are logged as one summary line with counts
+    per reason and result.
+    """
     try:
         extraction = chatgpt.extract_conversations(iter_conversations(path), now=now)
-        for reason, count in extraction.issues["reason"].value_counts().items():
-            logger.warning("ChatGPT extraction issue %s: %s record(s)", reason, count)
-        no_usable_messages = extraction.messages.empty and not extraction.issues.empty
-        if no_usable_messages:
-            raise InvalidChatGPTExport("processing failures left no messages in the study window")
-        logger.info(
-            "Extracted %s ChatGPT messages with %s processing issue(s)",
-            len(extraction.messages),
-            len(extraction.issues),
-        )
-        yield FlushLogs
-        return extraction, False
     except InvalidChatGPTExport as error:
-        logger.info("Rejected ChatGPT export: %s", error)
-        yield FlushLogs
-        retry_result = yield render_data_submission_page(
-            [retry_confirmation(no_usable_messages)]
+        logger.warning("Rejected ChatGPT export: %s", error)
+        return None, False
+    except chatgpt.UnsupportedExportFormat as error:
+        logger.warning("Rejected ChatGPT export: unsupported format, %s", error)
+        return None, False
+
+    if not extraction.issues.empty:
+        counts = extraction.issues.value_counts(["reason", "action"], sort=False)
+        logger.warning(
+            "Processing issues: %s",
+            ", ".join(f"{reason} {action}={count}" for (reason, action), count in counts.items()),
         )
-        return None, retry_result.__type__ == "PayloadTrue"
+    logger.info(
+        "Extracted %s ChatGPT messages with %s processing issue(s)",
+        len(extraction.messages),
+        len(extraction.issues),
+    )
+    if extraction.messages.empty and not extraction.issues.empty:
+        logger.warning("Rejected ChatGPT export: processing failures left no messages in the study window")
+        return None, True
+    return extraction, False
 
 
 def iter_conversations(path: Any) -> Iterator[Any]:
@@ -290,7 +328,7 @@ def prompt_consent(extraction: chatgpt.ExtractionResult) -> list[Any]:
         "time": props.Translatable({"en": "Time", "de": "Zeit", "nl": "Tijd"}),
     }
     column_widths = {"conversation title": 3, "role": 1, "message": 6, "model": 1.2, "time": 1.8}
-    consent_tables: list[Any] = [
+    consent_tables = [
         props.PropsUIPromptConsentFormTable(
             id=f"chatgpt_conversations_{number}",
             number=number,
@@ -314,38 +352,6 @@ def prompt_consent(extraction: chatgpt.ExtractionResult) -> list[Any]:
         )
         for number, table in enumerate(tables, start=1)
     ]
-    issue_count = len(extraction.issues)
-    issue_table_count = (issue_count + TABLE_ROW_LIMIT - 1) // TABLE_ROW_LIMIT
-    if issue_count:
-        issue_description = props.Translatable({
-            "en": f"Some records could not be processed ({issue_count} issues) and were excluded. Conversation and message numbers below refer to their positions in the export. This report is included in your donation; you may remove rows before donating.",
-            "de": f"Einige Datensätze konnten nicht verarbeitet werden ({issue_count} Probleme) und wurden ausgeschlossen. Die Nummern beziehen sich auf ihre Positionen im Export. Dieser Bericht wird mitgespendet; Sie können vor der Spende Zeilen entfernen.",
-            "nl": f"Sommige gegevens konden niet worden verwerkt ({issue_count} problemen) en zijn uitgesloten. De nummers hieronder verwijzen naar hun positie in de export. Dit rapport wordt meegedoneerd; u kunt voor het doneren rijen verwijderen.",
-        })
-        consent_tables.append(props.PropsUIPromptText(issue_description))
-    for number, start in enumerate(range(0, issue_count, TABLE_ROW_LIMIT), start=1):
-        suffix = "" if issue_table_count == 1 else f" ({number}/{issue_table_count})"
-        consent_tables.append(
-            props.PropsUIPromptConsentFormTable(
-                id=f"chatgpt_processing_issues_{number}",
-                number=table_count + number,
-                title=props.Translatable({
-                    "en": f"Processing issues{suffix}",
-                    "de": f"Verarbeitungsprobleme{suffix}",
-                    "nl": f"Verwerkingsproblemen{suffix}",
-                }),
-                description=issue_description,
-                data_frame=extraction.issues.iloc[start:start + TABLE_ROW_LIMIT].reset_index(drop=True),
-                data_frame_max_size=TABLE_ROW_LIMIT,
-                headers={
-                    "conversation": props.Translatable({"en": "Conversation", "de": "Unterhaltung", "nl": "Gesprek"}),
-                    "message": props.Translatable({"en": "Message", "de": "Nachricht", "nl": "Bericht"}),
-                    "reason": props.Translatable({"en": "Reason", "de": "Grund", "nl": "Reden"}),
-                    "action": props.Translatable({"en": "Result", "de": "Ergebnis", "nl": "Resultaat"}),
-                },
-                column_widths={"conversation": 1, "message": 1, "reason": 3, "action": 2},
-            )
-        )
     return [
         props.PropsUIPromptText(
             props.Translatable(
@@ -376,6 +382,13 @@ def donate(key: str, json_string: str) -> CommandSystemDonate:
     return CommandSystemDonate(key, json_string)
 
 
+def donate_logs(key: str) -> CommandSystemDonate:
+    """Donate the flow log collected so far (reference: port-chatgpt-uu)."""
+    log_string = LOG_STREAM.getvalue()
+    log_data = log_string.split("\n") if log_string else ["no logs"]
+    return donate(key, json.dumps(log_data))
+
+
 if __name__ == "__main__":
     import sys
 
@@ -383,9 +396,4 @@ if __name__ == "__main__":
         print("Usage: python -m port.script path/to/chatgpt-export.zip")
         raise SystemExit(1)
 
-    generator = extract_export(sys.argv[1])
-    try:
-        while True:
-            next(generator)
-    except StopIteration as result:
-        print(result.value)
+    print(extract_export(sys.argv[1]))

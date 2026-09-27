@@ -67,8 +67,7 @@ that accepts only the observed format and reports anything else ("fail soon"):
   (`thoughts`, `reasoning_recap`) are rows with an empty message.
 - Only observed encodings are accepted: timestamps as numeric Unix seconds, the
   hidden flag as a boolean (normally absent), titles as strings. Absent model
-  or metadata (user messages) is an empty model. Other encodings and unknown
-  content types without `parts` are reported as issues, not guessed.
+  or metadata (user messages) is an empty model.
 - The table shows messages from the last twelve calendar months (UTC), newest
   first. Note: the reference kept export order (conversations in file order,
   messages in mapping order).
@@ -80,18 +79,32 @@ that accepts only the observed format and reports anything else ("fail soon"):
   Each file must be at most 256 MiB of readable UTF-8 JSON without duplicate
   keys. A missing listed file or unreadable JSON rejects the export with a retry.
 
-Records that cannot be interpreted safely are excluded individually instead of
-failing the whole export or silently disappearing. Each exclusion is reported in
-a separate donated table, `chatgpt_processing_issues_N`, with columns
-`conversation` and `message` (1-based positions across the whole export), `reason` (a
-fixed code such as `invalid_timestamp`, `future_timestamp`, `invalid_content`,
-`invalid_mapping`) and `action` (`message_excluded` or `conversation_excluded`).
-The report never contains titles, text or export IDs; participants can review
-and remove its rows like any other table. The issues table is only present when
-issues occur, so exports without issues donate exactly the same JSON as before.
-If failures leave no usable messages, the participant is asked to retry rather
-than donating an issues-only report. Messages outside the study window are not
-issues.
+Two kinds of failure are handled differently:
+
+- **Format change** (fail soon): a field present on every conversation or
+  message has an unknown shape, e.g. a timestamp that is no longer a number or
+  a missing `mapping` or `author.role`. Every message would be affected, so
+  extraction stops at the first occurrence and the export is rejected with a
+  retry. The log names the reason code and position, so the script can be fixed
+  and participants can be asked to donate again.
+- **Unusable single message**: an unknown content type without `parts`, a
+  timestamp in the future (device clock), or text that cannot be serialized.
+  Only that message is skipped; extraction continues. If nothing usable remains,
+  the export is rejected with a retry.
+
+Both are logged as warnings without titles, text or export IDs. Skipped
+messages are logged as one summary line with counts per reason, e.g.
+`Processing issues: unknown_content_type:canvas message_excluded=3`. Every log
+line reaches two channels:
+
+- the host log (`CommandSystemLog`, forwarded by Next to AppSignal), so Eyra
+  sees format changes early;
+- the tracking donation `<session>-tracking`, as in the Utrecht reference
+  (`donate_logs`): the flow log is donated at every step, whatever the consent
+  decision, so researchers can account for skipped messages in their analysis.
+
+The consent screen shows only the conversation tables; its donated JSON is
+unchanged. Messages outside the study window are not issues.
 
 Coverage is in `packages/python/tests/` and `tests/donation.spec.ts`, using
 synthetic fixtures shaped like the real exports. No split export has been
