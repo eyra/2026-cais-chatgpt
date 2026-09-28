@@ -164,18 +164,27 @@ def process(sessionId):
     content = read_asset("my_file.txt")
 ```
 
-### Data Frame Size limits
+### Dataframe limits and worker memory
 
-Row limits for data frames in the Props UI:
-- Consent Table: default maximum of 10,000 rows (configurable)
-- UI hard cap: 100,000 rows
+CAIS currently sets `TABLE_ROW_LIMIT` in `port/script.py` to 100,000 and uses one
+paginated table. The globally newest eligible messages up to that limit are
+included in review and donation; older excess messages are excluded.
 
-CAIS explicitly sets `TABLE_ROW_LIMIT` in `port/script.py` to **100,000** and
-uses one paginated table. The globally newest 100,000 eligible messages are
-included in review and donation; older messages beyond the cap are excluded.
-There is no automatic table splitting or conversation-boundary preservation.
-The cap is a table-performance safeguard, not a guarantee of browser memory
-safety or upload success: message lengths and device resources still matter.
+The framework's Python consent-table API defaults to 10,000 rows and accepts
+`data_frame_max_size=None` for explicitly unlimited tables. There is no hidden
+JavaScript row cutoff. Scripts must choose limits appropriate for their data,
+devices and host upload limits.
+
+Serialized command strings cross the worker boundary as transferable UTF-8
+buffers and are decoded before UI handling. Responses return only their payload,
+not the original command, and transferred Python command proxies are released.
+Encoding leaves script-owned props unchanged. Deploy the Python wheel, worker
+and framework together; public script dictionaries and host donation JSON remain
+unchanged. This does not add runtime-error recovery.
+
+The inherited `tests/generate_memory_zip.py` and `tests/memory-benchmark.cjs`
+exercise the upstream Feldspar demo, not CAIS's ChatGPT extraction. Run them in
+an [upstream Feldspar checkout](https://github.com/eyra/feldspar#reproducing-large-donation-memory-use).
 
 ### Local extraction debugging (CLI)
 

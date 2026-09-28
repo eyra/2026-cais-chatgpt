@@ -21,7 +21,6 @@ export const DataSubmissionPage = (props: Props): JSX.Element => {
   const DataSubmissionData = React.useRef<Map<string, string>>(new Map());
 
   const onDataSubmissionDataChanged = useCallback((key: string, value: any)=> {
-    console.log("onDataSubmissionDataChanged", key, value);
     DataSubmissionData.current.set(key, value);
   }, [DataSubmissionData]);
 
