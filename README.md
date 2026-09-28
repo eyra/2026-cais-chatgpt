@@ -68,13 +68,13 @@ that accepts only the observed format and reports anything else ("fail soon"):
 - Only observed encodings are accepted: timestamps as numeric Unix seconds, the
   hidden flag as a boolean (normally absent), titles as strings. Absent model
   or metadata (user messages) is an empty model.
-- The table shows messages from the time window, newest first. The window is
-  `TIME_WINDOW_MONTHS` in `port/script.py`, currently set to **24 calendar months**
-  (UTC) before upload for temporary testing. The CAIS requirement remains 12
-  months; `None` keeps all messages. The window used is recorded in the tracking
-  donation. A test release with another window is a
-  `feature/*` branch that changes only this value (CI builds a release per
-  branch). Note: the reference had no window and kept export order
+- The table shows messages newest first. The optional time window is
+  `TIME_WINDOW_MONTHS` in `port/script.py`, currently set to **`None`**: no month
+  cutoff. Set it to a positive number to keep only the last N calendar months
+  (UTC) before upload. The window used is recorded in the tracking donation.
+  The 100,000-row performance cap applies independently of the month window.
+  A test release with another window can change only this value (CI builds a
+  release per branch). The reference had no window and kept export order
   (conversations in file order, messages in mapping order).
 - `packages/python/port/script.py` validates the archive boundary. Current
   exports list their files in `export_manifest.json`; large exports may split
@@ -168,14 +168,14 @@ def process(sessionId):
 
 Row limits for data frames in the Props UI:
 - Consent Table: default maximum of 10,000 rows (configurable)
-- UI hard cap: 50,000 rows (cannot be exceeded)
+- UI hard cap: 100,000 rows
 
-For CAIS, do not sample or truncate. `TABLE_ROW_LIMIT` in `port/script.py` sets the
-maximum rows per table (10,000 by default, configurable up to 50,000). Split the
-sorted messages before constructing consent-table props. Preserve contiguous
-conversation boundaries where possible; split oversized conversations without
-changing message order or losing rows. Interleaved conversations may still span
-tables because global newest-first ordering takes precedence.
+CAIS explicitly sets `TABLE_ROW_LIMIT` in `port/script.py` to **100,000** and
+uses one paginated table. The globally newest 100,000 eligible messages are
+included in review and donation; older messages beyond the cap are excluded.
+There is no automatic table splitting or conversation-boundary preservation.
+The cap is a table-performance safeguard, not a guarantee of browser memory
+safety or upload success: message lengths and device resources still matter.
 
 ### Local extraction debugging (CLI)
 

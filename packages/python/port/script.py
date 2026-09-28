@@ -19,7 +19,6 @@ from typing import Any
 import zipfile
 import zlib
 
-import pandas as pd
 
 import port.api.props as props
 from port import chatgpt
@@ -42,14 +41,13 @@ logger = logging.getLogger(__name__)
 CHATGPT_EXPORT_FILE = "conversations.json"
 EXPORT_MANIFEST_FILE = "export_manifest.json"
 MAX_EXPORT_JSON_BYTES = 256 * 1024 * 1024
-MIN_TABLE_ROW_LIMIT = 10_000
-MAX_TABLE_ROW_LIMIT = 50_000
-TABLE_ROW_LIMIT = 10_000
+# Performance safeguard: keep the newest messages in one paginated table.
+TABLE_ROW_LIMIT = 100_000
 # Time window: messages from the last N calendar months (UTC) before the
-# upload; None keeps all messages. A test release with another window is a
+# upload; None disables the month cutoff. A test release with another window is a
 # branch that changes only this value. Locally: python -m port.script
 # export.zip --window-months 24 (or none).
-TIME_WINDOW_MONTHS: int | None = 24
+TIME_WINDOW_MONTHS: int | None = None
 
 
 class InvalidChatGPTExport(ValueError):
@@ -84,7 +82,11 @@ def process(data: dict[str, str]) -> Generator:
 
     logger.info("Prompt consent")
     yield donate_logs(tracking_key)
-    result = yield render_data_submission_page(prompt_consent(extraction))
+    pending_consent = [render_data_submission_page(prompt_consent(extraction))]
+    del extraction, file_result
+    # Pop transfers ownership to the wrapper: this suspended generator must not
+    # retain either the extraction or the table frames after serialization.
+    result = yield pending_consent.pop()
     if result.__type__ == "PayloadJSON":
         logger.info("Data donated")
         yield donate(f"{session_id}-chatgpt-conversations", result.value)
@@ -245,40 +247,6 @@ def unique_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     return result
 
 
-def partition_dataframe(
-    frame: pd.DataFrame, row_limit: int = TABLE_ROW_LIMIT
-) -> list[pd.DataFrame]:
-    """Split a sorted frame without truncation, respecting contiguous conversations."""
-    validate_table_row_limit(row_limit)
-    if frame.empty:
-        return [pd.DataFrame(columns=MESSAGE_COLUMNS)]
-
-    tables: list[pd.DataFrame] = []
-    start = 0
-    total_rows = len(frame)
-    while start < total_rows:
-        end = min(start + row_limit, total_rows)
-        if end < total_rows and frame.iloc[end - 1]["_conversation"] == frame.iloc[end]["_conversation"]:
-            boundary = end
-            while boundary > start and frame.iloc[boundary - 1]["_conversation"] == frame.iloc[end]["_conversation"]:
-                boundary -= 1
-            if boundary > start:
-                end = boundary
-
-        tables.append(frame.iloc[start:end][MESSAGE_COLUMNS].reset_index(drop=True))
-        start = end
-
-    return tables
-
-
-def validate_table_row_limit(row_limit: int) -> None:
-    if not MIN_TABLE_ROW_LIMIT <= row_limit <= MAX_TABLE_ROW_LIMIT:
-        raise ValueError(
-            f"table row limit must be between {MIN_TABLE_ROW_LIMIT} and {MAX_TABLE_ROW_LIMIT}"
-        )
-
-
-
 def render_data_submission_page(body: list[Any]) -> CommandUIRender:
     header = props.PropsUIHeader(
         props.Translatable(
@@ -349,8 +317,7 @@ def no_messages_notice(extraction: chatgpt.ExtractionResult) -> props.PropsUIPro
 
 
 def prompt_consent(extraction: chatgpt.ExtractionResult) -> list[Any]:
-    tables = partition_dataframe(extraction.messages)
-    table_count = len(tables)
+    table = extraction.messages.head(TABLE_ROW_LIMIT)[MESSAGE_COLUMNS].reset_index(drop=True)
     titles = {
         "en": "Your conversations with ChatGPT",
         "de": "Ihre Unterhaltungen mit ChatGPT",
@@ -369,19 +336,14 @@ def prompt_consent(extraction: chatgpt.ExtractionResult) -> list[Any]:
     column_widths = {"conversation title": 3, "role": 1, "message": 6, "model": 1.2, "time": 1.8}
     consent_tables = [
         props.PropsUIPromptConsentFormTable(
-            id=f"chatgpt_conversations_{number}",
-            number=number,
-            title=props.Translatable(
-                {
-                    locale: title if table_count == 1 else f"{title} ({number}/{table_count})"
-                    for locale, title in titles.items()
-                }
-            ),
+            id="chatgpt_conversations_1",
+            number=1,
+            title=props.Translatable(titles),
             description=props.Translatable(
                 {
-                    "en": "All messages, newest first.",
-                    "de": "Alle Nachrichten, neueste zuerst.",
-                    "nl": "Alle berichten, nieuwste eerst.",
+                    "en": "Messages, newest first.",
+                    "de": "Nachrichten, neueste zuerst.",
+                    "nl": "Berichten, nieuwste eerst.",
                 }
                 if TIME_WINDOW_MONTHS is None else
                 {
@@ -395,7 +357,6 @@ def prompt_consent(extraction: chatgpt.ExtractionResult) -> list[Any]:
             headers=headers,
             column_widths=column_widths,
         )
-        for number, table in enumerate(tables, start=1)
     ]
     return [
         props.PropsUIPromptText(

@@ -1,6 +1,6 @@
 import { PropsUITableRow } from '../types/elements';
 
-export const MAX_ROWS = 50000;
+export const MAX_ROWS = 100000;
 
 export function truncateRows(rows: PropsUITableRow[], maxRows: number = MAX_ROWS) {
   const truncatedRowCount = Math.max(0, rows.length - maxRows);

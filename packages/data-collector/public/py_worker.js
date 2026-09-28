@@ -80,6 +80,10 @@ function runCycle(payload) {
       error: error.toString(),
       stack: error.stack || "",
     });
+  } finally {
+    // toJs creates ordinary JS values; release the serialized Python command
+    // immediately instead of waiting for the proxy's garbage collection.
+    scriptEvent.destroy();
   }
 }
 

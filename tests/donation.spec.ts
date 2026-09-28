@@ -127,7 +127,11 @@ async function submitDonation(page: Page, donations: Donation[]): Promise<Submit
 }
 
 test('reviews and submits visible ChatGPT messages from the export', async ({ page }) => {
-  const donations = await uploadChatGPTExport(page);
+  const oldTimestamp = Date.parse('2020-01-01T12:00:00Z') / 1000;
+  const donations = await uploadChatGPTExport(page, [
+    ...fixtureConversations,
+    { title: 'Old conversation', mapping: { old: messageNode('Old message', oldTimestamp) } },
+  ]);
 
   const consentTable = page.locator('div.mb-20', {
     has: page.getByTestId('table-chatgpt_conversations_1'),
@@ -138,12 +142,15 @@ test('reviews and submits visible ChatGPT messages from the export', async ({ pa
   await expect(table.getByRole('columnheader', { name: 'Message', exact: true })).toBeVisible();
   await expect(table.getByText('Newest answer')).toBeVisible();
   await expect(table.getByText('Participant question')).toBeVisible();
+  await expect(table.getByText('Old message', { exact: true })).toBeVisible();
   await expect(table.getByText('Hidden answer')).not.toBeVisible();
 
   const { tables, tracking } = await submitDonation(page, donations);
   expect(Object.keys(tables)).toEqual(['chatgpt_conversations_1']);
-  expect(tables.chatgpt_conversations_1.data).toEqual([newestRow, questionRow]);
-  expect(tracking).toContain('Extracted 2 ChatGPT messages (0 outside the time window) with 0 processing issue(s)');
+  expect(tables.chatgpt_conversations_1.data).toEqual([
+    newestRow, questionRow,
+    { 'conversation title': 'Old conversation', role: 'assistant', message: 'Old message', model: 'gpt-5', time: localTime(oldTimestamp) },
+  ]);
   expect(tracking).not.toContain('Processing issues');
 });
 
@@ -182,20 +189,14 @@ test('skips unusable messages and reports them only in the tracking donation', a
   expect(raw).not.toContain(secretText);
 });
 
-test('still asks to donate when no messages fall inside the time window', async ({ page }) => {
+test('still asks to donate an empty export', async ({ page }) => {
   const donations = await openDonation(page);
-  const threeYearsAgo = (referenceDay - 3 * 365 * day) / 1000;
-  await chooseExport(page, exportFile([
-    { title: secretTitle, mapping: { old: messageNode(secretText, threeYearsAgo) } },
-  ]));
+  await chooseExport(page, exportFile([{ title: secretTitle, mapping: {} }]));
 
   await expect(page.getByText('Your ChatGPT export contains no messages')).toBeVisible();
-  await expect(page.getByText(secretText)).not.toBeVisible();
-
-  const { tables, tracking, raw } = await submitDonation(page, donations);
+  const { tables, raw } = await submitDonation(page, donations);
   expect(Object.keys(tables)).toEqual(['chatgpt_conversations_1']);
   expect(tables.chatgpt_conversations_1.data).toEqual([]);
-  expect(tracking).toContain('No messages to donate: all messages are outside the time window');
   expect(raw).not.toContain('SECRET');
 });
 

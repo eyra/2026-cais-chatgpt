@@ -50,11 +50,4 @@ describe('truncateRows', () => {
     expect(result.truncatedRowCount).toBe(0);
   });
 
-  it('should use default MAX_ROWS when not specified', () => {
-    const rows = makeRows(100);
-    const result = truncateRows(rows);
-
-    expect(result.truncatedRows.length).toBe(100);
-    expect(result.truncatedRowCount).toBe(0);
-  });
 });

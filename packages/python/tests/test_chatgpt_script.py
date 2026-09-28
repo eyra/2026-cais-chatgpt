@@ -1,11 +1,14 @@
 """Behavioural coverage for the CAIS ChatGPT donation extractor."""
 
 from datetime import datetime, timezone
+import gc
 import json
 from pathlib import Path
 import subprocess
 import sys
 import textwrap
+from types import SimpleNamespace
+import weakref
 import zipfile
 
 import pandas as pd
@@ -14,6 +17,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from port import chatgpt, script
+from port.api.commands import CommandSystemDonate, CommandUIRender
 
 NOW = datetime(2026, 9, 21, 12, 0, tzinfo=timezone.utc)
 
@@ -229,37 +233,17 @@ def test_extraction_keeps_visible_recent_messages_in_descending_time_order():
     ]
 
 
-def test_partition_moves_a_complete_next_conversation_to_the_next_table():
-    frame = make_frame([0] * 9_999 + [1] * 2)
+def test_consent_keeps_one_table_with_the_newest_100000_messages():
+    frame = make_frame([0] * 100_001)
+    extraction = chatgpt.ExtractionResult(messages=frame, issues=pd.DataFrame())
 
-    tables = script.partition_dataframe(frame)
+    body = script.prompt_consent(extraction)
+    tables = [item.toDict() for item in body if isinstance(item, script.props.PropsUIPromptConsentFormTable)]
 
-    assert [len(table) for table in tables] == [9_999, 2]
-    assert tables[0]["conversation title"].iloc[-1] == "Conversation 0"
-    assert tables[1]["conversation title"].iloc[0] == "Conversation 1"
-
-
-def test_partition_splits_a_conversation_larger_than_the_limit_without_losing_rows():
-    frame = make_frame([0] * 10_001)
-
-    tables = script.partition_dataframe(frame)
-
-    assert [len(table) for table in tables] == [10_000, 1]
-    assert pd.concat(tables, ignore_index=True)["message"].to_list() == frame["message"].to_list()
-
-
-def test_partition_preserves_an_empty_result_table():
-    table = script.partition_dataframe(pd.DataFrame(columns=[*script.MESSAGE_COLUMNS, "_conversation"]))
-
-    assert len(table) == 1
-    assert list(table[0].columns) == script.MESSAGE_COLUMNS
-    assert table[0].empty
-
-
-@pytest.mark.parametrize("row_limit", [9_999, 50_001])
-def test_table_row_limit_is_constrained_to_the_framework_range(row_limit):
-    with pytest.raises(ValueError, match="between 10000 and 50000"):
-        script.validate_table_row_limit(row_limit)
+    assert [table["id"] for table in tables] == ["chatgpt_conversations_1"]
+    data = json.loads(tables[0]["data_frame"])
+    assert list(data) == script.MESSAGE_COLUMNS
+    assert list(data["message"].values()) == [str(index) for index in range(100_000)]
 
 
 @pytest.mark.parametrize(
@@ -341,7 +325,8 @@ def test_export_with_only_skipped_messages_is_rejected(tmp_path):
     ([conversation("Old", [message("user", timestamp(2020, 1, 1), ["Old"])])], 1),
     ([conversation("Empty", [])], 0),
 ])
-def test_nothing_in_the_window_still_reaches_consent_not_failures(tmp_path, payload, outside_window):
+def test_nothing_in_the_window_still_reaches_consent_not_failures(tmp_path, monkeypatch, payload, outside_window):
+    monkeypatch.setattr(script, "TIME_WINDOW_MONTHS", 12)
     extraction, problem = script.extract_export(write_export(tmp_path, payload), now=NOW)
     assert problem is None
     assert extraction.messages.empty
@@ -422,11 +407,71 @@ def test_tracking_records_a_format_change_rejection(tmp_path):
     assert "PRIVATE" not in tracking
 
 
-def test_empty_window_still_donates_and_tracks_why(tmp_path):
-    payload = [conversation("PRIVATE_TITLE", [message("user", timestamp(2020, 1, 1), ["PRIVATE_TEXT"])])]
+def test_empty_export_still_donates_and_tracks_why(tmp_path):
+    payload = [conversation("PRIVATE_TITLE", [])]
     donations = dict(run_flow(write_export(tmp_path, payload)))
     assert set(donations) == {"s-tracking", "s-chatgpt-conversations"}
     tracking = "\n".join(donations["s-tracking"])
-    assert "Extracted 0 ChatGPT messages (1 outside the time window)" in tracking
+    assert "Extracted 0 ChatGPT messages (0 outside the time window)" in tracking
     assert "Data donated" in tracking
     assert "PRIVATE" not in tracking
+
+
+def test_consent_handoff_releases_python_frames_and_donates_reviewed_data(tmp_path, monkeypatch):
+    path = write_export(tmp_path, [
+        conversation("Review", [
+            message("user", datetime.now(timezone.utc).timestamp() - 60, ["Keep"]),
+            message("assistant", datetime.now(timezone.utc).timestamp() - 30, ["Remove"]),
+        ]),
+    ])
+    retained = []
+    extract_export = script.extract_export
+    prompt_consent = script.prompt_consent
+
+    def track_extraction(*args, **kwargs):
+        extraction, problem = extract_export(*args, **kwargs)
+        retained.extend(weakref.ref(value) for value in (
+            extraction, extraction.messages, extraction.issues,
+        ))
+        return extraction, problem
+
+    def track_tables(extraction):
+        body = prompt_consent(extraction)
+        retained.extend(
+            weakref.ref(item.data_frame) for item in body
+            if isinstance(item, script.props.PropsUIPromptConsentFormTable)
+        )
+        return body
+
+    monkeypatch.setattr(script, "extract_export", track_extraction)
+    monkeypatch.setattr(script, "prompt_consent", track_tables)
+    flow = script.process({"sessionId": "memory"})
+    try:
+        command = next(flow)
+        while isinstance(command, CommandSystemDonate):
+            command = flow.send(None)
+        command = flow.send(SimpleNamespace(__type__="PayloadFile", value=path))
+        while isinstance(command, CommandSystemDonate):
+            command = flow.send(None)
+        assert isinstance(command, CommandUIRender)
+        page = command.toDict()["page"]
+        del command
+        gc.collect()
+        assert all(reference() is None for reference in retained)
+
+        table = next(item for item in page["body"] if item["__type__"] == "PropsUIPromptConsentFormTable")
+        rows = json.loads(table["data_frame"])
+        assert set(rows["message"].values()) == {"Keep", "Remove"}
+        kept = next(key for key, text in rows["message"].items() if text == "Keep")
+        reviewed = json.dumps({
+            table["id"]: {
+                "data": [{column: values[kept] for column, values in rows.items()}],
+                "metadata": {"deletedRowCount": 1},
+            },
+        })
+        donation = flow.send(SimpleNamespace(__type__="PayloadJSON", value=reviewed))
+        assert donation.key == "memory-chatgpt-conversations"
+        assert json.loads(donation.json_string)[table["id"]]["data"][0]["message"] == "Keep"
+        assert "Remove" not in donation.json_string
+    finally:
+        flow.close()

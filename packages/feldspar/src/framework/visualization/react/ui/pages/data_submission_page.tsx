@@ -27,7 +27,6 @@ export const DataSubmissionPage = (props: Props): JSX.Element => {
 
   function onDonate(): void {
     const DataSubmissionDataObject = Object.fromEntries(DataSubmissionData.current);
-    console.log("onDonate", JSON.stringify(DataSubmissionDataObject));
     props.resolve?.({ __type__: "PayloadJSON", value: JSON.stringify(DataSubmissionDataObject) });
   }
 
