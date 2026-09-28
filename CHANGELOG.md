@@ -11,6 +11,7 @@
 
 ## Unreleased — CAIS ChatGPT
 
+* Fixed unsupported-format guidance: participants are now asked to email support@eyra.co with their study name, without attaching their export or conversation contents. Added English, German and Dutch wording; invalid/unreadable exports retain the original-ZIP guidance.
 * Changed CAIS consent to one paginated table containing the newest 100,000 eligible messages; older excess messages are excluded from review and donation. Removed automatic table splitting and raised the framework's JavaScript hard cap from 50,000 to 100,000 rows. This is a performance safeguard, not a memory-safety guarantee; no new participant warning was added.
 * Fixed retention of extracted Python dataframes while participants review consent: ownership now ends after consent serialization, and the worker explicitly releases transferred Python command proxies. Review adjustments and donated data are unchanged.
 * Removed full-donation console serialization from both consent-page variants, avoiding an extra JSON allocation when donating.

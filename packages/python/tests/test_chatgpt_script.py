@@ -309,7 +309,7 @@ def test_format_change_rejects_export_and_logs_its_position(tmp_path, caplog):
         conversation("PRIVATE_TITLE", [message("user", "2026-09-20T12:00:00Z", ["PRIVATE_TEXT"])]),
     ]
     with caplog.at_level("WARNING", logger="port.script"):
-        assert script.extract_export(write_export(tmp_path, payload), now=NOW) == (None, "unreadable")
+        assert script.extract_export(write_export(tmp_path, payload), now=NOW) == (None, "unsupported_format")
     assert caplog.records[-1].getMessage() == (
         "Rejected ChatGPT export: unsupported format, reason=invalid_timestamp conversation=2 message=1"
     )

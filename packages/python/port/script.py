@@ -104,8 +104,8 @@ def extract_export(
 ) -> tuple[chatgpt.ExtractionResult | None, str | None]:
     """Return the extraction, or None and why the export cannot be used.
 
-    The reason is "unreadable" or "unusable" (processing failures left no
-    messages). An export without messages in the time window is returned
+    The reason is "unreadable", "unsupported_format", or "unusable" (processing
+    failures left no messages). An export without messages in the time window is returned
     normally: the participant still completes the consent step with an empty
     table, which is informative for researchers too. Rejections, format changes
     and skipped messages are logged as warnings, so they reach both the
@@ -122,7 +122,7 @@ def extract_export(
         return None, "unreadable"
     except chatgpt.UnsupportedExportFormat as error:
         logger.warning("Rejected ChatGPT export: unsupported format, %s", error)
-        return None, "unreadable"
+        return None, "unsupported_format"
 
     if not extraction.issues.empty:
         counts = extraction.issues.value_counts(["reason", "action"], sort=False)
@@ -293,6 +293,12 @@ def nothing_to_donate(problem: str | None) -> props.PropsUIPromptConfirm:
             "en": f"Some records could not be processed, and no messages{within['en']} remain. Please select a different ZIP file.",
             "de": f"Einige Datensätze konnten nicht verarbeitet werden, und es verbleiben keine Nachrichten{within['de']}. Bitte wählen Sie eine andere ZIP-Datei.",
             "nl": f"Sommige gegevens konden niet worden verwerkt en er blijven geen berichten{within['nl']} over. Selecteer een ander ZIP-bestand.",
+        }
+    elif problem == "unsupported_format":
+        text = {
+            "en": "This ChatGPT export uses a format we do not support yet. Please email support@eyra.co and mention the study you are participating in. Do not attach your ChatGPT export or conversation contents.",
+            "de": "Dieser ChatGPT-Export verwendet ein Format, das wir noch nicht unterstützen. Bitte schreiben Sie eine E-Mail an support@eyra.co und nennen Sie die Studie, an der Sie teilnehmen. Fügen Sie weder Ihren ChatGPT-Export noch Gesprächsinhalte bei.",
+            "nl": "Deze ChatGPT-export gebruikt een formaat dat we nog niet ondersteunen. Stuur een e-mail naar support@eyra.co en vermeld aan welk onderzoek u deelneemt. Stuur uw ChatGPT-export of gespreksinhoud niet mee.",
         }
     else:
         text = {
