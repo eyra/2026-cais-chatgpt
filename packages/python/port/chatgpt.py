@@ -18,6 +18,8 @@ import calendar
 from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import heapq
+import json
 import math
 import re
 from typing import Any
@@ -57,6 +59,7 @@ class ExtractionResult:
     # Visible messages dated before the window (not parsed further): tells
     # "nothing recent" apart from "no messages at all" when `messages` is empty.
     outside_window: int = 0
+    outside_byte_limit: int = 0
 
 
 class _FormatChange(Exception):
@@ -199,11 +202,14 @@ def extract_conversations(
     conversations: Iterable[Any],
     now: datetime | None = None,
     window_months: int | None = None,
+    max_data_bytes: int | None = None,
 ) -> ExtractionResult:
     """Keep messages from the last `window_months` calendar months (UTC), newest first.
 
-    window_months=None keeps all messages. Raises UnsupportedExportFormat at the
-    first format change. Skipped messages are returned as issues. Locations are
+    window_months=None disables the date cutoff. max_data_bytes optionally bounds
+    the compact UTF-8 JSON row array, retaining a newest-first prefix of whole
+    messages. Raises UnsupportedExportFormat at the first format change.
+    Skipped messages are returned as issues. Locations are
     1-based positions across the whole export (all parts), never export IDs or
     participant text. Conversations are consumed once, in order, so a lazy
     iterable keeps only the current export part in memory. Hidden messages and
@@ -212,6 +218,10 @@ def extract_conversations(
     """
     if window_months is not None and (isinstance(window_months, bool) or window_months < 1):
         raise ValueError(f"window_months must be a positive number of months or None, got {window_months!r}")
+    if max_data_bytes is not None and (
+        isinstance(max_data_bytes, bool) or not isinstance(max_data_bytes, int) or max_data_bytes < 2
+    ):
+        raise ValueError("max_data_bytes must fit at least an empty JSON array")
     if now is None:
         now = datetime.now(timezone.utc)
     current = now.replace(tzinfo=timezone.utc) if now.tzinfo is None else now.astimezone(timezone.utc)
@@ -219,6 +229,10 @@ def extract_conversations(
     rows = []
     issues = []
     outside_window = 0
+    outside_byte_limit = 0
+    row_bytes = 0
+    sequence = 0
+    discarded_through = None
 
     def issue(conversation: int, message: int | None, reason: str) -> None:
         issues.append({
@@ -261,18 +275,43 @@ def extract_conversations(
             if fields is None:
                 continue
             created, role, text, model, local_time = fields
-            rows.append((created, {
+            # The encounter index preserves stable ordering for equal timestamps.
+            key = (created, -sequence)
+            sequence += 1
+            if discarded_through is not None and key <= discarded_through:
+                outside_byte_limit += 1
+                continue
+            row = {
                 "conversation title": title,
                 "role": role,
                 "message": text,
                 "model": model,
                 "time": local_time,
-                "_conversation": conversation_position - 1,
-            }))
+            }
+            size = 0
+            if max_data_bytes is not None:
+                # Count a comma per row; the complete nonempty array then adds
+                # one byte (two brackets minus the first row's absent comma).
+                size = len(json.dumps(row, ensure_ascii=False, separators=(",", ":")).encode("utf-8")) + 1
+            row["_conversation"] = conversation_position - 1
+            entry = (*key, size, row)
+            if max_data_bytes is None:
+                rows.append(entry)
+            else:
+                heapq.heappush(rows, entry)
+                row_bytes += size
+                while rows and row_bytes + 1 > max_data_bytes:
+                    oldest = heapq.heappop(rows)
+                    row_bytes -= oldest[2]
+                    discarded_through = oldest[:2]
+                    outside_byte_limit += 1
+                # Keep the cutoff even if the heap becomes empty. Otherwise a
+                # later, older small message could bypass an oversized newer one.
 
-    rows.sort(key=lambda row: row[0], reverse=True)
+    rows.sort(reverse=True)
     return ExtractionResult(
-        messages=pd.DataFrame([row for _, row in rows], columns=[*MESSAGE_COLUMNS, "_conversation"]),
+        messages=pd.DataFrame([row[3] for row in rows], columns=[*MESSAGE_COLUMNS, "_conversation"]),
         issues=pd.DataFrame(issues, columns=ISSUE_COLUMNS, dtype=str),
         outside_window=outside_window,
+        outside_byte_limit=outside_byte_limit,
     )

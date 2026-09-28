@@ -363,3 +363,109 @@ def test_without_window_all_messages_are_kept():
 def test_window_must_be_a_positive_number_of_months(months):
     with pytest.raises(ValueError):
         extract(conversation(), window_months=months)
+
+
+def donated_rows(result):
+    return result.messages[chatgpt.MESSAGE_COLUMNS].to_dict("records")
+
+
+def donated_bytes(rows):
+    return len(json.dumps(rows, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+
+
+def test_byte_budget_counts_utf8_escaping_and_array_separators_exactly():
+    source = conversation({
+        "newest": node(
+            create_time=CREATED + 2,
+            author={"role": '工具"user'},
+            metadata={"model_slug": "模型\\test"},
+            content={"parts": ['\U0001d11e café 漢字\n"quoted"\\path']},
+        ),
+        "next": node(create_time=CREATED + 1, content={"parts": ["第二 \U0001d11e\tmessage"]}),
+        "oldest": node(content={"parts": ["older"]}),
+    }, title='会話 \U0001d11e\n"title"')
+    expected = donated_rows(extract(source))[:2]
+    budget = donated_bytes(expected)
+
+    exact = chatgpt.extract_conversations([source], now=NOW, max_data_bytes=budget)
+    below = chatgpt.extract_conversations([source], now=NOW, max_data_bytes=budget - 1)
+
+    assert donated_rows(exact) == expected
+    assert exact.outside_byte_limit == 1
+    assert donated_bytes(donated_rows(exact)) == budget
+    assert donated_rows(below) == expected[:1]
+    assert below.outside_byte_limit == 2
+    assert donated_bytes(donated_rows(below)) <= budget - 1
+
+
+def test_byte_budget_sorts_single_pass_shards_and_keeps_encounter_order_for_ties():
+    shards = [
+        [conversation({
+            "old": node(content={"parts": ["oldest"]}),
+            "first-tie": node(create_time=CREATED + 1, content={"parts": ["tie-aa"]}),
+        })],
+        [conversation({
+            "second-tie": node(create_time=CREATED + 1, content={"parts": ["tie-bb"]}),
+            "new": node(create_time=CREATED + 2, content={"parts": ["newest"]}),
+        })],
+        [conversation({
+            "third-tie": node(create_time=CREATED + 1, content={"parts": ["tie-cc"]}),
+        })],
+    ]
+    all_rows = donated_rows(extract(*(item for shard in shards for item in shard)))
+    rows_by_message = {row["message"]: row for row in all_rows}
+    expected = [rows_by_message[text] for text in ["newest", "tie-aa", "tie-bb"]]
+    budget = donated_bytes(expected)
+    single_pass = (item for shard in shards for item in shard)
+
+    result = chatgpt.extract_conversations(single_pass, now=NOW, max_data_bytes=budget)
+
+    assert donated_rows(result) == expected
+    assert result.outside_byte_limit == 2
+    assert donated_bytes(donated_rows(result)) == budget
+
+
+def test_oversized_newest_message_blocks_older_messages_that_would_fit():
+    older = conversation({"old": node(content={"parts": ["small"]})})
+    budget = donated_bytes(donated_rows(extract(older)))
+    newest = conversation({
+        "new": node(create_time=CREATED + 1, content={"parts": ["large" * 100]}),
+    })
+
+    result = chatgpt.extract_conversations(
+        iter([newest, older]), now=NOW, max_data_bytes=budget,
+    )
+
+    assert donated_rows(result) == []
+    assert result.outside_byte_limit == 2
+    assert donated_bytes(donated_rows(result)) == 2
+
+
+def test_late_newer_message_survives_eviction_without_reopening_older_cutoff():
+    initial = conversation({
+        "old-a": node(create_time=CREATED + 1, content={"parts": ["old-a"]}),
+        "old-b": node(content={"parts": ["old-b"]}),
+    })
+    budget = donated_bytes(donated_rows(extract(initial)))
+    oversized = conversation({
+        "blocker": node(create_time=CREATED + 2, content={"parts": ["large" * 100]}),
+    })
+    late_newest = conversation({
+        "new": node(create_time=CREATED + 3, content={"parts": ["newer"]}),
+    })
+    late_oldest = conversation({
+        "old": node(create_time=CREATED - 1, content={"parts": ["older"]}),
+    })
+    expected = donated_rows(extract(late_newest))
+    # The late oldest row fits the remaining space, but lies beyond the cutoff.
+    assert donated_bytes(expected + donated_rows(extract(late_oldest))) == budget
+
+    result = chatgpt.extract_conversations(
+        iter([initial, oversized, late_newest, late_oldest]),
+        now=NOW,
+        max_data_bytes=budget,
+    )
+
+    assert donated_rows(result) == expected
+    assert result.outside_byte_limit == 4
+    assert donated_bytes(donated_rows(result)) < budget

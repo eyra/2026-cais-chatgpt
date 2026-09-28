@@ -12,7 +12,7 @@
 ## Unreleased — CAIS ChatGPT
 
 * Fixed unsupported-format guidance: participants are now asked to email support@eyra.co with their study name, without attaching their export or conversation contents. Added English, German and Dutch wording; invalid/unreadable exports retain the original-ZIP guidance.
-* Changed CAIS consent to one paginated table containing the newest 100,000 eligible messages; older excess messages are excluded from review and donation. Removed automatic table splitting and raised the framework's JavaScript hard cap from 50,000 to 100,000 rows. This is a performance safeguard, not a memory-safety guarantee; no new participant warning was added.
+* Changed CAIS consent to one paginated table containing the newest whole-message prefix within 200,000,000 bytes of final UTF-8 donation JSON, including all donated fields and envelope metadata. Selection is bounded during extraction; older messages beyond the cutoff are excluded. Removed CAIS's row limit and the framework's JavaScript row cutoff; the Python table API accepts `None` for no row limit while retaining its numeric defaults. No new participant warning was added.
 * Fixed retention of extracted Python dataframes while participants review consent: ownership now ends after consent serialization, and the worker explicitly releases transferred Python command proxies. Review adjustments and donated data are unchanged.
 * Removed full-donation console serialization from both consent-page variants, avoiding an extra JSON allocation when donating.
 * Changed extraction from the Utrecht reference's recursive substring matching to explicit field parsing. Donated keys, values and local-time formatting are unchanged: verified message-by-message against the unmodified reference on four real exports, including branches, image parts (flattened like the reference) and reasoning messages (rows with an empty message). Similarly named metadata can no longer override roles/models or be appended to message text.
@@ -21,7 +21,7 @@
 * Added a configurable time window, `TIME_WINDOW_MONTHS`, now set to `None` (no month cutoff). Positive values enable a calendar-month window. Participant texts and the tracking log follow the setting; `python -m port.script export.zip --window-months 24` (or `--window-months none`) runs it locally and prints counts only.
 * Changed exports without messages in the time window to still reach the consent step, with a notice explaining the empty table, so the participant donates it instead of ending without a donation.
 * Added the Utrecht reference's tracking donation: the flow log, including rejections and skipped-message summaries, is donated as `<session>-tracking` at every step, whatever the consent decision, and forwarded as `CommandSystemLog` to the host (AppSignal). Logs contain positions and reason codes only, no participant text.
-* Added support for split exports: `conversations.json` files listed in `export_manifest.json` are read in order, one at a time, keeping peak memory to one file.
+* Added support for split exports: `conversations.json` files listed in `export_manifest.json` are read in order, one at a time alongside the byte-bounded retained messages.
 * Added archive safeguards: 256 MiB per JSON file, rejection of missing listed files, duplicate JSON keys, unreadable or excessively nested JSON, and text that cannot be serialized.
 * Fixed future-dated timestamps passing the twelve-month filter.
 * Removed `port/helpers.py` (reference fuzzy-matching helpers).

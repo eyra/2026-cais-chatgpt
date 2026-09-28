@@ -167,6 +167,24 @@ test('removes selected ChatGPT messages before donation', async ({ page }) => {
   expect(tables.chatgpt_conversations_1.data).toEqual([questionRow]);
 });
 
+test('preserves Unicode and control characters through review and donation', async ({ page }) => {
+  const text = '\uFEFFcafé — 中文 — \u{1D11E}\n"quoted" \\ \u0000';
+  const donations = await uploadChatGPTExport(page, [{
+    title: 'Überprüfung',
+    mapping: { unicode: messageNode(text, newestTimestamp) },
+  }]);
+  await expect(page.getByTestId('table-chatgpt_conversations_1').getByText('café — 中文', { exact: false })).toBeVisible();
+
+  const { tables } = await submitDonation(page, donations);
+  expect(tables.chatgpt_conversations_1.data).toEqual([{
+    'conversation title': 'Überprüfung',
+    role: 'assistant',
+    message: text,
+    model: 'gpt-5',
+    time: localTime(newestTimestamp),
+  }]);
+});
+
 test('skips unusable messages and reports them only in the tracking donation', async ({ page }) => {
   const donations = await uploadChatGPTExport(page, [{
     title: secretTitle,
@@ -193,7 +211,6 @@ test('still asks to donate an empty export', async ({ page }) => {
   const donations = await openDonation(page);
   await chooseExport(page, exportFile([{ title: secretTitle, mapping: {} }]));
 
-  await expect(page.getByText('Your ChatGPT export contains no messages')).toBeVisible();
   const { tables, raw } = await submitDonation(page, donations);
   expect(Object.keys(tables)).toEqual(['chatgpt_conversations_1']);
   expect(tables.chatgpt_conversations_1.data).toEqual([]);

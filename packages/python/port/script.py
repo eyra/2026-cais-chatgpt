@@ -1,7 +1,7 @@
 """CAIS ChatGPT data-donation flow.
 
 Explicit ChatGPT parsing lives in port.chatgpt. This module handles bounded,
-part-by-part archive loading, lossless review-table partitioning and the
+part-by-part archive loading, byte-budgeted message selection and the
 Feldspar consent flow. As in the Utrecht reference, the flow log (including
 records that could not be processed) is donated as "<session>-tracking" and
 forwarded to the host as CommandSystemLog.
@@ -41,8 +41,14 @@ logger = logging.getLogger(__name__)
 CHATGPT_EXPORT_FILE = "conversations.json"
 EXPORT_MANIFEST_FILE = "export_manifest.json"
 MAX_EXPORT_JSON_BYTES = 256 * 1024 * 1024
-# Performance safeguard: keep the newest messages in one paginated table.
-TABLE_ROW_LIMIT = 100_000
+# Bound actual donation JSON, leaving headroom below Next's 210 MB request limit.
+MAX_DONATION_BYTES = 200_000_000
+CONVERSATIONS_TABLE_ID = "chatgpt_conversations_1"
+DONATION_ENVELOPE_BYTES = len(json.dumps(
+    {CONVERSATIONS_TABLE_ID: {"data": [], "metadata": {"deletedRowCount": 0}}},
+    ensure_ascii=False,
+    separators=(",", ":"),
+).encode("utf-8")) - 2  # The extractor counts the row array's brackets itself.
 # Time window: messages from the last N calendar months (UTC) before the
 # upload; None disables the month cutoff. A test release with another window is a
 # branch that changes only this value. Locally: python -m port.script
@@ -115,7 +121,10 @@ def extract_export(
     logger.info("Time window: %s", window_label())
     try:
         extraction = chatgpt.extract_conversations(
-            iter_conversations(path), now=now, window_months=TIME_WINDOW_MONTHS
+            iter_conversations(path),
+            now=now,
+            window_months=TIME_WINDOW_MONTHS,
+            max_data_bytes=MAX_DONATION_BYTES - DONATION_ENVELOPE_BYTES,
         )
     except InvalidChatGPTExport as error:
         logger.warning("Rejected ChatGPT export: %s", error)
@@ -136,11 +145,18 @@ def extract_export(
         extraction.outside_window,
         len(extraction.issues),
     )
+    if extraction.outside_byte_limit:
+        logger.info(
+            "Excluded %s message(s) outside the %s-byte donation budget",
+            extraction.outside_byte_limit, MAX_DONATION_BYTES,
+        )
     if extraction.messages.empty:
-        if not extraction.issues.empty:
+        if extraction.outside_byte_limit:
+            logger.info("No messages to donate: the newest message exceeds the donation byte budget")
+        elif not extraction.issues.empty:
             logger.warning("Rejected ChatGPT export: processing failures left no messages in the time window")
             return None, "unusable"
-        if extraction.outside_window:
+        elif extraction.outside_window:
             logger.info("No messages to donate: all messages are outside the time window")
         else:
             logger.info("No messages to donate: the export contains no messages")
@@ -316,14 +332,14 @@ def no_messages_notice(extraction: chatgpt.ExtractionResult) -> props.PropsUIPro
     """Why the table is empty; the participant still completes the step."""
     within = window_phrase() if extraction.outside_window else {"en": "", "de": "", "nl": ""}
     return props.PropsUIPromptText(props.Translatable({
-        "en": f"Your ChatGPT export contains no messages{within['en']}, so the table below is empty. Please click “Yes, donate” to complete this step.",
-        "de": f"Ihr ChatGPT-Export enthält keine Nachrichten{within['de']}, daher ist die Tabelle unten leer. Bitte klicken Sie auf „Ja, spenden“, um diesen Schritt abzuschließen.",
-        "nl": f"Uw ChatGPT-export bevat geen berichten{within['nl']}, daarom is de tabel hieronder leeg. Klik op ‘Ja, doneer’ om deze stap af te ronden.",
+        "en": f"No messages{within['en']} are available to donate, so the table below is empty. Please click “Yes, donate” to complete this step.",
+        "de": f"Es sind keine Nachrichten{within['de']} für die Spende verfügbar, daher ist die Tabelle unten leer. Bitte klicken Sie auf „Ja, spenden“, um diesen Schritt abzuschließen.",
+        "nl": f"Er zijn geen berichten{within['nl']} beschikbaar om te doneren, daarom is de tabel hieronder leeg. Klik op ‘Ja, doneer’ om deze stap af te ronden.",
     }))
 
 
 def prompt_consent(extraction: chatgpt.ExtractionResult) -> list[Any]:
-    table = extraction.messages.head(TABLE_ROW_LIMIT)[MESSAGE_COLUMNS].reset_index(drop=True)
+    table = extraction.messages[MESSAGE_COLUMNS].reset_index(drop=True)
     titles = {
         "en": "Your conversations with ChatGPT",
         "de": "Ihre Unterhaltungen mit ChatGPT",
@@ -342,7 +358,7 @@ def prompt_consent(extraction: chatgpt.ExtractionResult) -> list[Any]:
     column_widths = {"conversation title": 3, "role": 1, "message": 6, "model": 1.2, "time": 1.8}
     consent_tables = [
         props.PropsUIPromptConsentFormTable(
-            id="chatgpt_conversations_1",
+            id=CONVERSATIONS_TABLE_ID,
             number=1,
             title=props.Translatable(titles),
             description=props.Translatable(
@@ -359,7 +375,7 @@ def prompt_consent(extraction: chatgpt.ExtractionResult) -> list[Any]:
                 }
             ),
             data_frame=table,
-            data_frame_max_size=TABLE_ROW_LIMIT,
+            data_frame_max_size=None,
             headers=headers,
             column_widths=column_widths,
         )

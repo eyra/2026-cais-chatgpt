@@ -72,14 +72,14 @@ that accepts only the observed format and reports anything else ("fail soon"):
   `TIME_WINDOW_MONTHS` in `port/script.py`, currently set to **`None`**: no month
   cutoff. Set it to a positive number to keep only the last N calendar months
   (UTC) before upload. The window used is recorded in the tracking donation.
-  The 100,000-row performance cap applies independently of the month window.
+  The donation byte budget applies independently of the month window.
   A test release with another window can change only this value (CI builds a
   release per branch). The reference had no window and kept export order
   (conversations in file order, messages in mapping order).
 - `packages/python/port/script.py` validates the archive boundary. Current
   exports list their files in `export_manifest.json`; large exports may split
   `conversations.json` into several files, which are read in manifest order,
-  one at a time, so peak memory is one file rather than the whole export.
+  one at a time, alongside the retained messages bounded by the donation budget.
   Exports without such a manifest must contain exactly one `conversations.json`.
   Each file must be at most 256 MiB of readable UTF-8 JSON without duplicate
   keys. A missing listed file or unreadable JSON rejects the export with a retry.
@@ -164,16 +164,26 @@ def process(sessionId):
     content = read_asset("my_file.txt")
 ```
 
-### Dataframe limits and worker memory
+### Donation size and worker memory
 
-CAIS currently sets `TABLE_ROW_LIMIT` in `port/script.py` to 100,000 and uses one
-paginated table. The globally newest eligible messages up to that limit are
-included in review and donation; older excess messages are excluded.
+CAIS sets `MAX_DONATION_BYTES` in `port/script.py` to **200,000,000 bytes**.
+This bounds the final UTF-8 donation JSON, including all five message fields,
+JSON escaping, separators, table identifiers and deletion metadata. It leaves
+approximately 10 MB for multipart overhead below Next's 210,000,000-byte
+whole-request limit; ZIP size and raw message text size are not the budget.
 
-The framework's Python consent-table API defaults to 10,000 rows and accepts
-`data_frame_max_size=None` for explicitly unlimited tables. There is no hidden
-JavaScript row cutoff. Scripts must choose limits appropriate for their data,
-devices and host upload limits.
+Extraction retains the globally newest whole-message prefix that fits.
+Older messages beyond the cutoff are excluded, even if a smaller older message
+would fit the remaining space. Equal timestamps retain export encounter order.
+Selection is bounded while reading the export, rather than accumulating every
+message and truncating afterward. If the newest eligible message alone exceeds
+the budget, consent still opens with an empty table. Excluded counts are logged;
+no new participant warning is shown.
+
+CAIS uses one paginated table with `data_frame_max_size=None`; there is no
+JavaScript row cutoff. More than 100,000 short messages can therefore be retained.
+The Python consent-table API still defaults to 10,000 rows for other callers;
+explicit numeric limits retain their existing behavior.
 
 Serialized command strings cross the worker boundary as transferable UTF-8
 buffers and are decoded before UI handling. Responses return only their payload,
@@ -181,6 +191,10 @@ not the original command, and transferred Python command proxies are released.
 Encoding leaves script-owned props unchanged. Deploy the Python wheel, worker
 and framework together; public script dictionaries and host donation JSON remain
 unchanged. This does not add runtime-error recovery.
+
+The budget is not a universal browser-memory guarantee: parsing an individual
+export file, dataframe objects and serialization still consume additional memory.
+The 256 MiB per-file safeguard remains; tab-crash recovery is a separate Next concern.
 
 The inherited `tests/generate_memory_zip.py` and `tests/memory-benchmark.cjs`
 exercise the upstream Feldspar demo, not CAIS's ChatGPT extraction. Run them in

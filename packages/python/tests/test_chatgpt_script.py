@@ -233,7 +233,7 @@ def test_extraction_keeps_visible_recent_messages_in_descending_time_order():
     ]
 
 
-def test_consent_keeps_one_table_with_the_newest_100000_messages():
+def test_consent_keeps_more_than_100000_short_messages_in_one_table():
     frame = make_frame([0] * 100_001)
     extraction = chatgpt.ExtractionResult(messages=frame, issues=pd.DataFrame())
 
@@ -243,7 +243,60 @@ def test_consent_keeps_one_table_with_the_newest_100000_messages():
     assert [table["id"] for table in tables] == ["chatgpt_conversations_1"]
     data = json.loads(tables[0]["data_frame"])
     assert list(data) == script.MESSAGE_COLUMNS
-    assert list(data["message"].values()) == [str(index) for index in range(100_000)]
+    assert list(data["message"].values()) == [str(index) for index in range(100_001)]
+
+
+def test_byte_budget_includes_envelope_and_escaped_unicode_rows(tmp_path, monkeypatch):
+    payload = [conversation("Überprüfung", [
+        message("user", timestamp(2026, 9, 1), ["Old"]),
+        message("assistant", timestamp(2026, 9, 20), ["\ufeffcafé 中文 \U0001d11e\n\"quoted\" \\ \x00"]),
+        message("user", timestamp(2026, 9, 19), ["Keep whole"]),
+    ])]
+    all_rows = chatgpt.extract_conversations(payload, now=NOW).messages[script.MESSAGE_COLUMNS].to_dict("records")
+
+    def donation_json(rows):
+        return json.dumps({
+            "chatgpt_conversations_1": {"data": rows, "metadata": {"deletedRowCount": 0}},
+        }, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+
+    exact_limit = len(donation_json(all_rows[:2]))
+    monkeypatch.setattr(script, "MAX_DONATION_BYTES", exact_limit)
+    path = write_export(tmp_path, payload)
+    extraction, problem = script.extract_export(path, now=NOW)
+    assert problem is None
+    assert extraction.outside_byte_limit == 1
+    table = next(
+        item.toDict() for item in script.prompt_consent(extraction)
+        if isinstance(item, script.props.PropsUIPromptConsentFormTable)
+    )
+    columns = json.loads(table["data_frame"])
+    reviewed = [
+        {column: values[index] for column, values in columns.items()}
+        for index in columns["message"]
+    ]
+    assert reviewed == all_rows[:2]
+    assert len(donation_json(reviewed)) == exact_limit
+
+    monkeypatch.setattr(script, "MAX_DONATION_BYTES", exact_limit - 1)
+    reduced, _ = script.extract_export(path, now=NOW)
+    assert reduced.messages[script.MESSAGE_COLUMNS].to_dict("records") == all_rows[:1]
+    assert reduced.outside_byte_limit == 2
+
+
+def test_valid_messages_exceeding_byte_budget_still_reach_empty_consent(tmp_path, monkeypatch):
+    monkeypatch.setattr(script, "MAX_DONATION_BYTES", script.DONATION_ENVELOPE_BYTES + 2)
+    path = write_export(tmp_path, [conversation("Too large", [
+        message("user", timestamp(2026, 9, 20), ["Cannot fit"]),
+    ])])
+    extraction, problem = script.extract_export(path, now=NOW)
+    assert problem is None
+    assert extraction.messages.empty
+    assert extraction.outside_byte_limit == 1
+    tables = [
+        item.toDict() for item in script.prompt_consent(extraction)
+        if isinstance(item, script.props.PropsUIPromptConsentFormTable)
+    ]
+    assert json.loads(tables[0]["data_frame"]) == {column: {} for column in script.MESSAGE_COLUMNS}
 
 
 @pytest.mark.parametrize(
