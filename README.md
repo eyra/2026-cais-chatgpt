@@ -177,8 +177,15 @@ Older messages beyond the cutoff are excluded, even if a smaller older message
 would fit the remaining space. Equal timestamps retain export encounter order.
 Selection is bounded while reading the export, rather than accumulating every
 message and truncating afterward. If the newest eligible message alone exceeds
-the budget, consent still opens with an empty table. Excluded counts are logged;
-no new participant warning is shown.
+the budget, consent still opens with an empty table and explains that the newest
+message is too large to include.
+
+The table description shows the original number of messages available for review,
+with localized number formatting. It does not change when participants remove rows.
+When the size limit excludes messages, the description also shows that count and
+explains that the newest messages were kept. These counts are not a total of every
+record in the export: hidden, unusable, and out-of-window messages are separate.
+Size-limit exclusions remain in the host monitoring and tracking-donation logs.
 
 CAIS uses one paginated table with `data_frame_max_size=None`; there is no
 JavaScript row cutoff. More than 100,000 short messages can therefore be retained.

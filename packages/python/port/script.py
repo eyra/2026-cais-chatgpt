@@ -330,6 +330,12 @@ def nothing_to_donate(problem: str | None) -> props.PropsUIPromptConfirm:
 
 def no_messages_notice(extraction: chatgpt.ExtractionResult) -> props.PropsUIPromptText:
     """Why the table is empty; the participant still completes the step."""
+    if extraction.outside_byte_limit:
+        return props.PropsUIPromptText(props.Translatable({
+            "en": "The newest message exceeds the data-size limit, so no messages could be included. Please click “Yes, donate” to complete this step.",
+            "de": "Die neueste Nachricht überschreitet die zulässige Datengröße, daher konnten keine Nachrichten aufgenommen werden. Bitte klicken Sie auf „Ja, spenden“, um diesen Schritt abzuschließen.",
+            "nl": "Het nieuwste bericht overschrijdt de limiet voor de gegevensgrootte, waardoor er geen berichten konden worden opgenomen. Klik op ‘Ja, doneer’ om deze stap af te ronden.",
+        }))
     within = window_phrase() if extraction.outside_window else {"en": "", "de": "", "nl": ""}
     return props.PropsUIPromptText(props.Translatable({
         "en": f"No messages{within['en']} are available to donate, so the table below is empty. Please click “Yes, donate” to complete this step.",
@@ -340,6 +346,40 @@ def no_messages_notice(extraction: chatgpt.ExtractionResult) -> props.PropsUIPro
 
 def prompt_consent(extraction: chatgpt.ExtractionResult) -> list[Any]:
     table = extraction.messages[MESSAGE_COLUMNS].reset_index(drop=True)
+    count = len(table)
+    local_count = f"{count:,}".replace(",", ".")
+    within = window_phrase()
+    description = {
+        "en": f"We found {count:,} {'message' if count == 1 else 'messages'}{within['en']} for you to review",
+        "de": f"Wir haben {local_count} {'Nachricht' if count == 1 else 'Nachrichten'}{within['de']} für Sie zum Überprüfen gefunden",
+        "nl": f"We hebben {local_count} {'bericht' if count == 1 else 'berichten'}{within['nl']} gevonden die u kunt bekijken",
+    }
+    if count:
+        for locale, text in {
+            "en": ", newest first. You can remove any you prefer not to share before donating.",
+            "de": ", die neuesten zuerst. Sie können vor der Spende entfernen, was Sie lieber nicht teilen möchten.",
+            "nl": ", de nieuwste eerst. U kunt vóór het doneren verwijderen wat u liever niet deelt.",
+        }.items():
+            description[locale] += text
+    else:
+        for locale in description:
+            description[locale] += "."
+    excluded = extraction.outside_byte_limit
+    if excluded:
+        local_excluded = f"{excluded:,}".replace(",", ".")
+        for locale, text in {
+            "en": f"{excluded:,} {'additional ' if count else ''}{'message was' if excluded == 1 else 'messages were'} excluded because of the data-size limit.",
+            "de": f"{local_excluded} {'weitere ' if count else ''}{'Nachricht wurde' if excluded == 1 else 'Nachrichten wurden'} wegen der zulässigen Datengröße ausgeschlossen.",
+            "nl": f"{local_excluded} {'extra ' if count else ''}{'bericht is' if excluded == 1 else 'berichten zijn'} uitgesloten vanwege de limiet voor de gegevensgrootte.",
+        }.items():
+            description[locale] += " " + text
+        if count:
+            for locale, text in {
+                "en": "The most recent messages were kept.",
+                "de": "Die neuesten Nachrichten wurden beibehalten.",
+                "nl": "De nieuwste berichten zijn behouden.",
+            }.items():
+                description[locale] += " " + text
     titles = {
         "en": "Your conversations with ChatGPT",
         "de": "Ihre Unterhaltungen mit ChatGPT",
@@ -361,19 +401,7 @@ def prompt_consent(extraction: chatgpt.ExtractionResult) -> list[Any]:
             id=CONVERSATIONS_TABLE_ID,
             number=1,
             title=props.Translatable(titles),
-            description=props.Translatable(
-                {
-                    "en": "Messages, newest first.",
-                    "de": "Nachrichten, neueste zuerst.",
-                    "nl": "Berichten, nieuwste eerst.",
-                }
-                if TIME_WINDOW_MONTHS is None else
-                {
-                    "en": f"Messages from the last {TIME_WINDOW_MONTHS} months, newest first.",
-                    "de": f"Nachrichten der letzten {TIME_WINDOW_MONTHS} Monate, neueste zuerst.",
-                    "nl": f"Berichten van de afgelopen {TIME_WINDOW_MONTHS} maanden, nieuwste eerst.",
-                }
-            ),
+            description=props.Translatable(description),
             data_frame=table,
             data_frame_max_size=None,
             headers=headers,
