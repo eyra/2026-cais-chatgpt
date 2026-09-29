@@ -11,7 +11,7 @@
 
 ## Unreleased — CAIS ChatGPT
 
-* Changed donation waiting text to add reassurance after 30 seconds: sending may take 10 minutes or longer on a slow connection. Reuses the existing message area in all seven framework languages, without upload-progress, transport, or host changes.
+* Changed donation waiting text to add reassurance after 30 seconds: sending may take 10 minutes or longer, without attributing the wait to the participant's connection. Reuses the existing message area in all seven framework languages, without upload-progress, transport, or host changes.
 * Changed the consent description to show the original review-message count in English, German and Dutch, with localized number formatting and plain-language review guidance. Show size-limit exclusions separately without treating them as the complete export total; explain when the newest message exceeds the budget and leaves an empty table. Participant deletions do not change the original review count.
 * Fixed unsupported-format guidance: participants are now asked to email support@eyra.co with their study name, without attaching their export or conversation contents. Added English, German and Dutch wording; invalid/unreadable exports retain the original-ZIP guidance.
 * Changed CAIS consent to one paginated table containing the newest whole-message prefix within 200,000,000 bytes of final UTF-8 donation JSON, including all donated fields and envelope metadata. Selection is bounded during extraction; older messages beyond the cutoff are excluded. Removed CAIS's row limit and the framework's JavaScript row cutoff; the Python table API accepts `None` for no row limit while retaining its numeric defaults.
