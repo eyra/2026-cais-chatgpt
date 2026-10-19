@@ -446,7 +446,7 @@ def test_consent_description_names_the_12_month_window(tmp_path):
     assert table["description"]["translations"] == {
         "en": "We found 1 message from the last 12 months for you to review, newest first. You can remove any you prefer not to share before donating.",
         "de": "Wir haben 1 Nachricht aus den letzten 12 Monaten für Sie zum Überprüfen gefunden, die neuesten zuerst. Sie können vor der Spende entfernen, was Sie lieber nicht teilen möchten.",
-        "nl": "We hebben 1 bericht uit de afgelopen 12 maanden gevonden die u kunt bekijken, de nieuwste eerst. U kunt vóór het doneren verwijderen wat u liever niet deelt.",
+        "nl": "We hebben 1 bericht uit de afgelopen 12 maanden gevonden dat u kunt bekijken, de nieuwste eerst. U kunt vóór het doneren verwijderen wat u liever niet deelt.",
     }
 
 
@@ -479,7 +479,7 @@ def test_undated_visible_message_rejects_the_export_whatever_the_window(tmp_path
     assert script.extract_export(write_export(tmp_path, payload), now=NOW) == (None, "unsupported_format")
 
 
-FLOW =textwrap.dedent("""
+FLOW = textwrap.dedent("""
     import json, sys
     from types import SimpleNamespace
     from port import script

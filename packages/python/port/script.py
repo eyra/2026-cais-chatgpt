@@ -353,7 +353,7 @@ def prompt_consent(extraction: chatgpt.ExtractionResult) -> list[Any]:
     description = {
         "en": f"We found {count:,} {'message' if count == 1 else 'messages'}{within['en']} for you to review",
         "de": f"Wir haben {local_count} {'Nachricht' if count == 1 else 'Nachrichten'}{within['de']} für Sie zum Überprüfen gefunden",
-        "nl": f"We hebben {local_count} {'bericht' if count == 1 else 'berichten'}{within['nl']} gevonden die u kunt bekijken",
+        "nl": f"We hebben {local_count} {'bericht' if count == 1 else 'berichten'}{within['nl']} gevonden {'dat' if count == 1 else 'die'} u kunt bekijken",
     }
     if count:
         for locale, text in {
