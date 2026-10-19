@@ -142,15 +142,17 @@ test('reviews and submits visible ChatGPT messages from the export', async ({ pa
   await expect(table.getByRole('columnheader', { name: 'Message', exact: true })).toBeVisible();
   await expect(table.getByText('Newest answer')).toBeVisible();
   await expect(table.getByText('Participant question')).toBeVisible();
-  await expect(table.getByText('Old message', { exact: true })).toBeVisible();
+  // Only the last 12 months are offered for donation.
+  await expect(page.getByText('We found 2 messages from the last 12 months', { exact: false })).toBeVisible();
+  await expect(table.getByText('Old message', { exact: true })).not.toBeVisible();
   await expect(table.getByText('Hidden answer')).not.toBeVisible();
 
-  const { tables, tracking } = await submitDonation(page, donations);
+  const { tables, tracking, raw } = await submitDonation(page, donations);
   expect(Object.keys(tables)).toEqual(['chatgpt_conversations_1']);
-  expect(tables.chatgpt_conversations_1.data).toEqual([
-    newestRow, questionRow,
-    { 'conversation title': 'Old conversation', role: 'assistant', message: 'Old message', model: 'gpt-5', time: localTime(oldTimestamp) },
-  ]);
+  expect(tables.chatgpt_conversations_1.data).toEqual([newestRow, questionRow]);
+  expect(raw).not.toContain('Old message');
+  expect(tracking).toContain('Time window: last 12 months');
+  expect(tracking).toContain('(1 outside the time window)');
   expect(tracking).not.toContain('Processing issues');
 });
 
@@ -214,6 +216,18 @@ test('still asks to donate an empty export', async ({ page }) => {
   const { tables, raw } = await submitDonation(page, donations);
   expect(Object.keys(tables)).toEqual(['chatgpt_conversations_1']);
   expect(tables.chatgpt_conversations_1.data).toEqual([]);
+  expect(raw).not.toContain('SECRET');
+});
+
+test('explains an empty table when no messages are from the last 12 months', async ({ page }) => {
+  const oldTimestamp = Date.parse('2020-01-01T12:00:00Z') / 1000;
+  const donations = await openDonation(page);
+  await chooseExport(page, exportFile([{ title: secretTitle, mapping: { old: messageNode(secretText, oldTimestamp) } }]));
+
+  await expect(page.getByText('No messages from the last 12 months are available to donate', { exact: false })).toBeVisible();
+  const { tables, tracking, raw } = await submitDonation(page, donations);
+  expect(tables.chatgpt_conversations_1.data).toEqual([]);
+  expect(tracking).toContain('No messages to donate: all messages are outside the time window');
   expect(raw).not.toContain('SECRET');
 });
 

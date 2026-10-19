@@ -50,10 +50,11 @@ DONATION_ENVELOPE_BYTES = len(json.dumps(
     separators=(",", ":"),
 ).encode("utf-8")) - 2  # The extractor counts the row array's brackets itself.
 # Time window: messages from the last N calendar months (UTC) before the
-# upload; None disables the month cutoff. A test release with another window is a
+# upload; None disables the month cutoff. CAIS asked for 12 months (data
+# protection and comparability). A test release with another window is a
 # branch that changes only this value. Locally: python -m port.script
 # export.zip --window-months 24 (or none).
-TIME_WINDOW_MONTHS: int | None = None
+TIME_WINDOW_MONTHS: int | None = 12
 
 
 class InvalidChatGPTExport(ValueError):
