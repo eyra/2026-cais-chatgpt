@@ -398,6 +398,87 @@ def test_time_window_setting_selects_messages(tmp_path, monkeypatch, window, kep
     assert extraction.messages["message"].tolist() == kept
 
 
+def test_release_keeps_only_the_last_12_months(tmp_path):
+    assert script.TIME_WINDOW_MONTHS == 12
+    payload = [conversation("Mixed", [
+        message("user", timestamp(2025, 9, 21, 12), ["Exactly 12 months"]),
+        message("user", timestamp(2025, 9, 21, 11), ["Just older"]),
+        message("assistant", timestamp(2026, 9, 20), ["Recent"]),
+    ])]
+    extraction, problem = script.extract_export(write_export(tmp_path, payload), now=NOW)
+    assert problem is None
+    assert extraction.messages["message"].tolist() == ["Recent", "Exactly 12 months"]
+    assert extraction.outside_window == 1
+
+
+def consent_texts(extraction: chatgpt.ExtractionResult) -> list[dict[str, str]]:
+    return [
+        item.toDict()["text"]["translations"] for item in script.prompt_consent(extraction)
+        if isinstance(item, script.props.PropsUIPromptText)
+    ]
+
+
+def test_export_without_recent_messages_explains_the_empty_table(tmp_path):
+    payload = [conversation("Old", [message("user", timestamp(2020, 1, 1), ["Old"])])]
+    extraction, problem = script.extract_export(write_export(tmp_path, payload), now=NOW)
+    assert problem is None
+    assert extraction.messages.empty
+    notice = consent_texts(extraction)[-1]
+    assert notice == {
+        "en": "No messages from the last 12 months are available to donate, so the table below is empty. Please click “Yes, donate” to complete this step.",
+        "de": "Es sind keine Nachrichten aus den letzten 12 Monaten für die Spende verfügbar, daher ist die Tabelle unten leer. Bitte klicken Sie auf „Ja, spenden“, um diesen Schritt abzuschließen.",
+        "nl": "Er zijn geen berichten uit de afgelopen 12 maanden beschikbaar om te doneren, daarom is de tabel hieronder leeg. Klik op ‘Ja, doneer’ om deze stap af te ronden.",
+    }
+    table = next(
+        item.toDict() for item in script.prompt_consent(extraction)
+        if isinstance(item, script.props.PropsUIPromptConsentFormTable)
+    )
+    assert table["description"]["translations"]["en"] == "We found 0 messages from the last 12 months for you to review."
+
+
+def test_consent_description_names_the_12_month_window(tmp_path):
+    payload = [conversation("Recent", [message("user", timestamp(2026, 9, 20), ["Recent"])])]
+    extraction, _ = script.extract_export(write_export(tmp_path, payload), now=NOW)
+    table = next(
+        item.toDict() for item in script.prompt_consent(extraction)
+        if isinstance(item, script.props.PropsUIPromptConsentFormTable)
+    )
+    assert table["description"]["translations"] == {
+        "en": "We found 1 message from the last 12 months for you to review, newest first. You can remove any you prefer not to share before donating.",
+        "de": "Wir haben 1 Nachricht aus den letzten 12 Monaten für Sie zum Überprüfen gefunden, die neuesten zuerst. Sie können vor der Spende entfernen, was Sie lieber nicht teilen möchten.",
+        "nl": "We hebben 1 bericht uit de afgelopen 12 maanden gevonden dat u kunt bekijken, de nieuwste eerst. U kunt vóór het doneren verwijderen wat u liever niet deelt.",
+    }
+
+
+def undated(entry: dict) -> dict:
+    entry["message"]["create_time"] = None
+    return entry
+
+
+def test_undated_hidden_messages_and_root_placeholders_are_ignored(tmp_path):
+    payload = [conversation("Recent", [
+        {"message": None, "parent": None},
+        undated(message("system", 0, [""], hidden=True)),
+        message("user", timestamp(2026, 9, 20), ["Recent"]),
+    ])]
+    extraction, problem = script.extract_export(write_export(tmp_path, payload), now=NOW)
+    assert problem is None
+    assert extraction.messages["message"].tolist() == ["Recent"]
+    assert extraction.issues.empty
+
+
+@pytest.mark.parametrize("window", [12, None])
+def test_undated_visible_message_rejects_the_export_whatever_the_window(tmp_path, monkeypatch, window):
+    # It cannot be placed inside or outside the window, and none were observed
+    # in real exports: like any unobserved timestamp it is a format change.
+    monkeypatch.setattr(script, "TIME_WINDOW_MONTHS", window)
+    payload = [conversation("Mixed", [
+        message("user", timestamp(2026, 9, 20), ["Recent"]),
+        undated(message("assistant", 0, ["Undated"])),
+    ])]
+    assert script.extract_export(write_export(tmp_path, payload), now=NOW) == (None, "unsupported_format")
+
+
 FLOW = textwrap.dedent("""
     import json, sys
     from types import SimpleNamespace
@@ -468,6 +549,18 @@ def test_empty_export_still_donates_and_tracks_why(tmp_path):
     assert "Extracted 0 ChatGPT messages (0 outside the time window)" in tracking
     assert "Data donated" in tracking
     assert "PRIVATE" not in tracking
+
+
+def test_export_without_recent_messages_still_donates_and_tracks_why(tmp_path):
+    payload = [conversation("PRIVATE_TITLE", [message("user", timestamp(2020, 1, 1), ["PRIVATE_TEXT"])])]
+    donations = dict(run_flow(write_export(tmp_path, payload)))
+    assert set(donations) == {"s-tracking", "s-chatgpt-conversations"}
+    tracking = "\n".join(donations["s-tracking"])
+    assert "Time window: last 12 months" in tracking
+    assert "Extracted 0 ChatGPT messages (1 outside the time window)" in tracking
+    assert "No messages to donate: all messages are outside the time window" in tracking
+    assert "Data donated" in tracking
+    assert "PRIVATE" not in json.dumps(donations)
 
 
 def test_consent_handoff_releases_python_frames_and_donates_reviewed_data(tmp_path, monkeypatch):

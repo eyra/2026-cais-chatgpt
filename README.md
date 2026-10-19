@@ -68,11 +68,21 @@ that accepts only the observed format and reports anything else ("fail soon"):
 - Only observed encodings are accepted: timestamps as numeric Unix seconds, the
   hidden flag as a boolean (normally absent), titles as strings. Absent model
   or metadata (user messages) is an empty model.
-- The table shows messages newest first. The optional time window is
-  `TIME_WINDOW_MONTHS` in `port/script.py`, currently set to **`None`**: no month
-  cutoff. Set it to a positive number to keep only the last N calendar months
-  (UTC) before upload. The window used is recorded in the tracking donation.
-  The donation byte budget applies independently of the month window.
+- Messages without a timestamp: hidden messages (such as the system prompt)
+  and empty root placeholders are skipped before the timestamp is read, as
+  before. A visible message without a numeric `create_time` cannot be placed
+  inside or outside the time window and was never observed in real exports, so,
+  like any other unobserved timestamp encoding, it is a format change that
+  rejects the export with the support guidance below.
+- The table shows messages newest first. The time window is
+  `TIME_WINDOW_MONTHS` in `port/script.py`, currently set to **`12`**: only
+  messages from the last 12 calendar months (UTC) before upload are offered for
+  donation, as CAIS requested. `None` disables the month cutoff. The window
+  used is recorded in the tracking donation, and the participant texts name it
+  ("from the last 12 months"). Messages are filtered by their own timestamp, so
+  a conversation that spans the cutoff contributes only its recent messages.
+  The 200 MB donation byte budget applies independently, after the month window;
+  with the window on, it only matters for very heavy recent use.
   A test release with another window can change only this value (CI builds a
   release per branch). The reference had no window and kept export order
   (conversations in file order, messages in mapping order).
@@ -220,6 +230,10 @@ The 256 MiB per-file safeguard remains; tab-crash recovery is a separate Next co
 The inherited `tests/generate_memory_zip.py` and `tests/memory-benchmark.cjs`
 exercise the upstream Feldspar demo, not CAIS's ChatGPT extraction. Run them in
 an [upstream Feldspar checkout](https://github.com/eyra/feldspar#reproducing-large-donation-memory-use).
+For CAIS, `tests/generate_chatgpt_export.py` writes a synthetic, ChatGPT-shaped
+export (split files with a manifest, messages spread over `--months`), e.g.
+`python3 tests/generate_chatgpt_export.py heavy.zip --mib 600 --months 36`; run
+it through the CLI below or upload it in the browser.
 
 ### Local extraction debugging (CLI)
 
