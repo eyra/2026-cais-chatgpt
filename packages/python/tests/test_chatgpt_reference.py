@@ -1,6 +1,7 @@
 """Public extraction contracts. Donated values mirror the Utrecht reference,
-verified message-by-message against real exports; only observed encodings are
-accepted."""
+verified message-by-message against real exports, except that an object or
+list part of a message (an image) is donated as a placeholder; only observed
+encodings are accepted."""
 
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
@@ -95,29 +96,46 @@ def test_similar_keys_cannot_override_explicit_fields_or_inject_text(local_zone)
     assert result.issues.empty
 
 
-def test_ordered_content_leaves_preserve_literal_text_and_only_parts():
+def test_ordered_parts_keep_literal_text_and_scalars_and_replace_object_parts():
     literal = "  <script>not markup</script>\n**bold** [link](https://example.org) citeturn1 \\n"
     content = {
-        "parts": [literal, {"content_type": "image", "asset_pointer": "asset://one", "width": 3}, [True, None, -2, 1.5], {"nested": {"citation": "[1]"}}, {}, []],
+        "parts": [literal, {"content_type": "image", "asset_pointer": "asset://one", "width": 3}, [True, None, -2, 1.5], {"nested": {"citation": "[1]"}}, {}, [], None, True, -2, 1.5],
         "text": "ignored fallback", "part_metadata": "ignored metadata",
     }
     result = extract(conversation({"node": node(content=content)}))
-    assert result.messages["message"].tolist() == [literal + "imageasset://one3TrueNone-21.5[1]"]
+    assert result.messages["message"].tolist() == [literal + "[image]" * 5 + "NoneTrue-21.5"]
     assert result.issues.empty
 
 
-def test_real_export_image_part_is_flattened_like_the_reference():
-    # Shape of a multimodal_text message in current exports (values synthetic).
-    image = {
-        "content_type": "image_asset_pointer", "asset_pointer": "sediment://file_x",
-        "size_bytes": 10, "width": 2, "height": 3, "fovea": None,
-        "metadata": {"dalle": None, "sanitized": True},
-    }
-    turn = node(content={"content_type": "multimodal_text", "parts": [image, "Describe"]})
+# Shape of an image part of a multimodal_text message in current exports (values synthetic).
+IMAGE_PART = {
+    "content_type": "image_asset_pointer", "asset_pointer": "sediment://file_x",
+    "size_bytes": 10, "width": 2, "height": 3, "fovea": None,
+    "metadata": {"dalle": None, "sanitized": True},
+}
+
+
+@pytest.mark.parametrize("parts, expected", [
+    ([IMAGE_PART, "Describe"], "[image]Describe"),
+    ([IMAGE_PART], "[image]"),
+    ([IMAGE_PART, IMAGE_PART], "[image][image]"),
+])
+def test_real_export_image_part_is_donated_as_a_placeholder_without_file_ids(parts, expected):
+    turn = node(content={"content_type": "multimodal_text", "parts": parts})
     turn["message"]["author"]["name"] = None
     result = extract(conversation({"node": turn}))
-    assert result.messages["message"].tolist() == ["image_asset_pointersediment://file_x1023NoneNoneTrueDescribe"]
+    assert result.messages["message"].tolist() == [expected]
+    assert "sediment://" not in json.dumps(result.messages.to_dict("records"))
     assert result.issues.empty
+
+
+def test_object_part_is_still_validated_before_it_is_replaced():
+    with pytest.raises(chatgpt.UnsupportedExportFormat) as raised:
+        extract(conversation({"bad": node(content={"parts": [{**IMAGE_PART, "width": float("nan")}]})}))
+    assert raised.value.reason == "invalid_content"
+    result = extract(conversation({"bad": node(content={"parts": [{**IMAGE_PART, "asset_pointer": "private\ud800value"}]}), "valid": node()}))
+    assert result.messages["message"].tolist() == ["Hello world"]
+    assert result.issues["reason"].tolist() == ["invalid_text"]
 
 
 @pytest.mark.parametrize("content", [
@@ -274,7 +292,7 @@ def test_depth_limit_is_a_format_change_not_partial_text():
     leaf = "at boundary"
     for _ in range(63):
         leaf = {"child": leaf}
-    assert extract(conversation({"valid": node(content={"parts": [leaf]})})).messages["message"].tolist() == ["at boundary"]
+    assert extract(conversation({"valid": node(content={"parts": [leaf]})})).messages["message"].tolist() == ["[image]"]
     with pytest.raises(chatgpt.UnsupportedExportFormat):
         extract(conversation({"invalid": node(content={"parts": ["prefix", [leaf]]})}))
 
