@@ -2,8 +2,10 @@
 
 The five donated fields and their values follow trbKnl/port-chatgpt-uu
 (AGPL-3.0), commit d80e9d834095034c9e80c85986bdab61fb8f152a, verified per
-message against real exports. Fields are read from their known locations only;
-value encodings that were never observed are not guessed.
+message against real exports, with one exception: an object or list part of a
+message (an image) is donated as NON_TEXT_PART instead of its flattened
+fields. Fields are read from their known locations only; value encodings that
+were never observed are not guessed.
 
 Two kinds of failure are distinguished:
 - A field present on every conversation or message has an unknown shape: the
@@ -33,6 +35,9 @@ _LABEL = re.compile(r"[a-z0-9_]{1,40}")
 # Observed reasoning content without parts; the reference donates these as
 # rows with an empty message. Other content types without parts are unknown.
 EMPTY_TEXT_CONTENT_TYPES = frozenset({"thoughts", "reasoning_recap"})
+# Donated in place of each object or list part of a message, such as an image
+# asset pointer, so no file ids are donated.
+NON_TEXT_PART = "[image]"
 
 
 class UnsupportedExportFormat(ValueError):
@@ -108,11 +113,15 @@ def _timestamp(value: Any) -> datetime:
 
 
 def _content_text(content: Any) -> str:
-    """Flatten parts like the reference: ordered scalar leaves, str()-converted.
+    """Join the parts; each object or list part becomes NON_TEXT_PART.
 
-    Nulls become "None" and booleans "True"/"False", as in the reference. The
-    parts list has depth zero; descendants may be at most 64 edges deep.
-    Iteration bounds deep input without relying on Python recursion.
+    The reference flattens an object part (an image asset pointer) into its
+    str()-converted scalar leaves, which donates file ids as text; CAIS donates
+    a placeholder instead (Flux 10452034951). Scalar parts are str()-converted
+    as in the reference. Every part is still validated leaf by leaf, so its
+    format changes and unusable text are reported as before. The parts list
+    has depth zero; descendants may be at most 64 edges deep. Iteration bounds
+    deep input without relying on Python recursion.
     """
     if not isinstance(content, dict):
         raise _FormatChange("invalid_content")
@@ -124,8 +133,20 @@ def _content_text(content: Any) -> str:
     parts = content["parts"]
     if not isinstance(parts, list):
         raise _FormatChange("invalid_content")
-    leaves = []
-    pending = [(parts, 0)]
+    texts = []
+    for part in parts:
+        _validate_leaves(part)
+        if isinstance(part, (dict, list)):
+            texts.append(NON_TEXT_PART)
+        else:
+            # Scalars as in the reference: nulls "None", booleans "True"/"False".
+            texts.append(part if isinstance(part, str) else str(part))
+    return "".join(texts)
+
+
+def _validate_leaves(part: Any) -> None:
+    """Raise for a part with an unknown shape or unusable text, like the reference reads it."""
+    pending = [(part, 1)]
     while pending:
         value, depth = pending.pop()
         if depth > 64:
@@ -137,16 +158,8 @@ def _content_text(content: Any) -> str:
         elif isinstance(value, str):
             if not _valid_text(value):
                 raise _Skip("invalid_text")
-            leaves.append(value)
-        elif value is None:
-            leaves.append("None")
-        elif isinstance(value, (bool, int)):
-            leaves.append(str(value))
-        elif isinstance(value, float) and math.isfinite(value):
-            leaves.append(str(value))
-        else:
+        elif not (value is None or isinstance(value, (bool, int)) or (isinstance(value, float) and math.isfinite(value))):
             raise _FormatChange("invalid_content")
-    return "".join(leaves)
 
 
 def _message_fields(
