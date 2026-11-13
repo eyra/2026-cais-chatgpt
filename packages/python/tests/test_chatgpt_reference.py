@@ -248,6 +248,14 @@ def test_unusable_message_is_skipped_and_reported_without_losing_siblings(conten
     assert result.issues.to_dict("records") == [{"conversation": "1", "message": "1", "reason": reason, "action": "message_excluded"}]
 
 
+def test_null_or_missing_timestamp_is_skipped_and_reported_by_type():
+    missing = node()
+    del missing["message"]["create_time"]
+    result = extract(conversation({"null": node(create_time=None), "missing": missing, "valid": node()}))
+    assert result.messages["message"].tolist() == ["Hello world"]
+    assert result.issues["reason"].tolist() == ["missing_timestamp:NoneType", "missing_timestamp:absent"]
+
+
 @pytest.mark.parametrize("timestamp", [CREATED, int(CREATED)])
 def test_numeric_unix_seconds_are_the_supported_timestamp(timestamp, local_zone):
     local_zone("UTC")
@@ -257,7 +265,7 @@ def test_numeric_unix_seconds_are_the_supported_timestamp(timestamp, local_zone)
 
 
 @pytest.mark.parametrize("timestamp, value_type", [
-    (None, "NoneType"), (True, "bool"), ({}, "dict"), ("", "str"), (str(CREATED), "str"),
+    (True, "bool"), ({}, "dict"), ("", "str"), (str(CREATED), "str"),
     (CREATED * 1000, "float"), ("2026-01-15T12:00:00Z", "str"),
     (float("nan"), "float"), (float("inf"), "float"), (float("-inf"), "float"), (1e30, "float"),
     (-(10**400), "int"),

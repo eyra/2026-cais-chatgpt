@@ -154,7 +154,7 @@ def extract_export(
     if extraction.messages.empty:
         if extraction.outside_byte_limit:
             logger.info("No messages to donate: the newest message exceeds the donation byte budget")
-        elif not extraction.issues.empty:
+        elif not extraction.issues.empty and not undated_only_beside_old(extraction):
             logger.warning("Rejected ChatGPT export: processing failures left no messages in the time window")
             return None, "unusable"
         elif extraction.outside_window:
@@ -162,6 +162,14 @@ def extract_export(
         else:
             logger.info("No messages to donate: the export contains no messages")
     return extraction, None
+
+
+def undated_only_beside_old(extraction: chatgpt.ExtractionResult) -> bool:
+    """Undated messages cannot be placed in the window; beside older dated
+    messages they do not make an export without recent messages unusable."""
+    return bool(extraction.outside_window) and bool(
+        extraction.issues["reason"].str.startswith("missing_timestamp:").all()
+    )
 
 
 def window_label() -> str:

@@ -11,9 +11,9 @@ Two kinds of failure are distinguished:
 - A field present on every conversation or message has an unknown shape: the
   export format changed. Extraction stops at the first occurrence by raising
   UnsupportedExportFormat, so the change is noticed immediately.
-- A single message cannot be used (unknown content type, future timestamp,
-  unserializable text): it is skipped and reported as an issue; extraction
-  continues.
+- A single message cannot be used (unknown content type, missing or null
+  timestamp, future timestamp, unserializable text): it is skipped and
+  reported as an issue; extraction continues.
 """
 
 import calendar
@@ -183,7 +183,13 @@ def _message_fields(
         raise _FormatChange("invalid_metadata")
     if _hidden_flag(metadata.get("is_visually_hidden_from_conversation")):
         return None
-    create_time = message.get("create_time")
+    if "create_time" not in message:
+        raise _Skip("missing_timestamp:absent")
+    create_time = message["create_time"]
+    if create_time is None:
+        # Publicly described for system messages without the hidden flag
+        # (Flux 10507872361). Other encodings remain format changes.
+        raise _Skip("missing_timestamp:NoneType")
     created = _timestamp(create_time)
     if created > current:
         raise _Skip("future_timestamp")
