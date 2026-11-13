@@ -538,7 +538,9 @@ def test_old_export_with_undated_system_messages_still_reaches_consent(tmp_path,
     assert problem is None
     assert extraction.messages.empty
     assert extraction.outside_window == 1
-    assert "No messages to donate: all messages are outside the time window" in caplog.text
+    assert (
+        "No messages to donate: all dated messages are outside the time window; undated messages were skipped"
+    ) in caplog.text
 
 
 @pytest.mark.parametrize("payload", [

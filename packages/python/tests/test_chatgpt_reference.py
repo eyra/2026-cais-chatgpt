@@ -256,6 +256,14 @@ def test_null_or_missing_timestamp_is_skipped_and_reported_by_type():
     assert result.issues["reason"].tolist() == ["missing_timestamp:NoneType", "missing_timestamp:absent"]
 
 
+def test_hidden_message_without_timestamp_key_is_ignored_without_issue():
+    hidden = node(metadata={"is_visually_hidden_from_conversation": True})
+    del hidden["message"]["create_time"]
+    result = extract(conversation({"hidden": hidden, "valid": node()}))
+    assert result.messages["message"].tolist() == ["Hello world"]
+    assert result.issues.empty
+
+
 @pytest.mark.parametrize("timestamp", [CREATED, int(CREATED)])
 def test_numeric_unix_seconds_are_the_supported_timestamp(timestamp, local_zone):
     local_zone("UTC")

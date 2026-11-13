@@ -103,7 +103,7 @@ def _hidden_flag(value: Any) -> bool:
 
 
 def _invalid_timestamp(value: Any) -> _FormatChange:
-    """Name the JSON type of the value (NoneType, str, float, ...), never the value."""
+    """Name the JSON type of the value (str, float, bool, ...), never the value."""
     return _FormatChange(f"invalid_timestamp:{type(value).__name__}")
 
 

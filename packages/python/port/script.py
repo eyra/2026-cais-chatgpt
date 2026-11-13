@@ -157,8 +157,10 @@ def extract_export(
         elif not extraction.issues.empty and not undated_only_beside_old(extraction):
             logger.warning("Rejected ChatGPT export: processing failures left no messages in the time window")
             return None, "unusable"
-        elif extraction.outside_window:
+        elif extraction.outside_window and extraction.issues.empty:
             logger.info("No messages to donate: all messages are outside the time window")
+        elif extraction.outside_window:
+            logger.info("No messages to donate: all dated messages are outside the time window; undated messages were skipped")
         else:
             logger.info("No messages to donate: the export contains no messages")
     return extraction, None
