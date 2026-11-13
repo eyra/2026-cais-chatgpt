@@ -102,14 +102,19 @@ def _hidden_flag(value: Any) -> bool:
     raise _FormatChange("invalid_hidden_flag")
 
 
+def _invalid_timestamp(value: Any) -> _FormatChange:
+    """Name the JSON type of the value (NoneType, str, float, ...), never the value."""
+    return _FormatChange(f"invalid_timestamp:{type(value).__name__}")
+
+
 def _timestamp(value: Any) -> datetime:
     """Exports use Unix seconds as numbers; any other encoding is a format change."""
     if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise _FormatChange("invalid_timestamp")
+        raise _invalid_timestamp(value)
     try:
         return datetime.fromtimestamp(value, timezone.utc)
     except (ValueError, OverflowError, OSError):
-        raise _FormatChange("invalid_timestamp") from None
+        raise _invalid_timestamp(value) from None
 
 
 def _content_text(content: Any) -> str:
@@ -178,7 +183,8 @@ def _message_fields(
         raise _FormatChange("invalid_metadata")
     if _hidden_flag(metadata.get("is_visually_hidden_from_conversation")):
         return None
-    created = _timestamp(message.get("create_time"))
+    create_time = message.get("create_time")
+    created = _timestamp(create_time)
     if created > current:
         raise _Skip("future_timestamp")
     if cutoff is not None and created < cutoff:
@@ -200,7 +206,7 @@ def _message_fields(
     try:
         local_time = created.astimezone().strftime("%Y-%m-%d %H:%M:%S")
     except (ValueError, OverflowError, OSError):
-        raise _FormatChange("invalid_timestamp") from None
+        raise _invalid_timestamp(create_time) from None
     return created, role, text, model, local_time
 
 

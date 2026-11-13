@@ -364,7 +364,7 @@ def test_format_change_rejects_export_and_logs_its_position(tmp_path, caplog):
     with caplog.at_level("WARNING", logger="port.script"):
         assert script.extract_export(write_export(tmp_path, payload), now=NOW) == (None, "unsupported_format")
     assert caplog.records[-1].getMessage() == (
-        "Rejected ChatGPT export: unsupported format, reason=invalid_timestamp conversation=2 message=1"
+        "Rejected ChatGPT export: unsupported format, reason=invalid_timestamp:str conversation=2 message=1"
     )
     assert "PRIVATE" not in caplog.text
 
@@ -479,7 +479,41 @@ def test_undated_visible_message_rejects_the_export_whatever_the_window(tmp_path
     assert script.extract_export(write_export(tmp_path, payload), now=NOW) == (None, "unsupported_format")
 
 
-FLOW = textwrap.dedent("""
+def test_undated_unflagged_system_message_rejection_logs_the_value_type(tmp_path, caplog):
+    # Flux 10507872361: CAIS exports were rejected at message 2, the first
+    # node after the root placeholder. Older exports are publicly described
+    # with an undated system message there that lacks the hidden flag.
+    system = {
+        "message": {
+            "author": {"role": "system", "name": None, "metadata": {}},
+            "create_time": None,
+            "update_time": None,
+            "content": {"content_type": "text", "parts": [""]},
+            "weight": 0.0,
+            "metadata": {},
+        }
+    }
+    payload = [
+        conversation("Recent", [
+            {"message": None, "parent": None},
+            undated(message("system", 0, [""], hidden=True)),
+            message("user", timestamp(2026, 9, 20), ["Recent"]),
+        ]),
+        conversation("PRIVATE_TITLE", [
+            {"message": None, "parent": None},
+            system,
+            message("user", timestamp(2023, 5, 1), ["PRIVATE_TEXT"]),
+        ]),
+    ]
+    with caplog.at_level("WARNING", logger="port.script"):
+        assert script.extract_export(write_export(tmp_path, payload), now=NOW) == (None, "unsupported_format")
+    assert caplog.records[-1].getMessage() == (
+        "Rejected ChatGPT export: unsupported format, reason=invalid_timestamp:NoneType conversation=2 message=2"
+    )
+    assert "PRIVATE" not in caplog.text
+
+
+FLOW =textwrap.dedent("""
     import json, sys
     from types import SimpleNamespace
     from port import script
@@ -536,7 +570,7 @@ def test_tracking_records_a_format_change_rejection(tmp_path):
     donations = run_flow(write_export(tmp_path, payload))
     assert {key for key, _ in donations} == {"s-tracking"}
     tracking = "\n".join(donations[-1][1])
-    assert "unsupported format, reason=invalid_timestamp conversation=1 message=1" in tracking
+    assert "unsupported format, reason=invalid_timestamp:str conversation=1 message=1" in tracking
     assert "Skipped during retry flow" in tracking
     assert "PRIVATE" not in tracking
 

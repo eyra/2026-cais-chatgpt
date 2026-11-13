@@ -11,6 +11,7 @@
 
 ## Unreleased — CAIS ChatGPT
 
+* Changed the `invalid_timestamp` rejection reason to name the JSON type of the offending `create_time` (for example `invalid_timestamp:NoneType` or `invalid_timestamp:str`), never its value, so the tracking log and AppSignal show which encoding rejected an export. Which timestamps are accepted is unchanged.
 * Fixed image messages being reviewed and donated as their flattened asset-pointer fields (`sediment://file_…None…`). Each object or list part of a message, such as an image, now becomes `[image]`; text and scalar parts are kept as in the Utrecht reference, and every part is still validated as before. This is the only deviation from the reference's donated values, so no file ids are donated.
 * Changed the time window, `TIME_WINDOW_MONTHS`, to 12 months, as CAIS requested: only messages from the last 12 calendar months (UTC) before upload are offered for donation. Sorting (newest first), the single table without a row limit and the 200 MB byte cap are unchanged. Participant texts (English, German, Dutch) now say “from the last 12 months”; an export without recent messages still reaches consent with a notice explaining the empty table. Visible messages without a timestamp remain a format change that rejects the export.
 * Changed donation waiting text to add reassurance after 30 seconds: sending may take 10 minutes or longer, without attributing the wait to the participant's connection. Reuses the existing message area in all seven framework languages, without upload-progress, transport, or host changes.
