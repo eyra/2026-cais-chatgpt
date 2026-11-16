@@ -17,7 +17,7 @@ Two kinds of failure are distinguished:
 
 A timestamp problem never rejects the export or drops a message (Flux
 10507872361). A message whose create_time is unusable (missing, null, another
-type, NaN/±inf, out of range) is kept: its time is inferred for the window and
+type, NaN/±inf, out of range, not convertible to local time) is kept: its time is inferred for the window and
 the sort order only, its donated time is empty, and it is reported as an issue
 with action "message_kept".
 """
@@ -128,39 +128,42 @@ def _timestamp(value: Any) -> datetime | None:
     return created
 
 
-def _ancestor_time(mapping: dict, node: dict) -> datetime | None:
+def _ancestor_time(mapping: dict, node: dict, times: dict[str, datetime | None]) -> datetime | None:
     """Time of the nearest dated ancestor via parent links, at most 64 steps up.
 
     Mapping order is node-id order, not time order: a parent may come after
-    its child, so the previous node in the file is no substitute.
+    its child, so the previous node in the file is no substitute. `times`
+    caches parsed node times for the conversation.
     """
     for _ in range(64):
         parent_id = node.get("parent")
         parent = mapping.get(parent_id) if isinstance(parent_id, str) else None
         if not isinstance(parent, dict):
             return None
-        message = parent.get("message")
-        created = _timestamp(message.get("create_time")) if isinstance(message, dict) else None
-        if created is not None:
-            return created
+        if parent_id not in times:
+            message = parent.get("message")
+            times[parent_id] = _timestamp(message.get("create_time")) if isinstance(message, dict) else None
+        if times[parent_id] is not None:
+            return times[parent_id]
         node = parent
     return None
 
 
 def _inferred_time(
-    mapping: dict, node: dict, updated: datetime | None, created: datetime | None
+    mapping: dict, node: dict, times: dict[str, datetime | None],
+    updated: datetime | None, created: datetime | None,
 ) -> tuple[datetime | None, datetime | None]:
     """(inferred time, window time) for a message without a usable time.
 
     The inferred time is the nearest dated ancestor's, else the conversation's
     update_time, then its create_time. The window time is the later of the
-    inferred time and the conversation's update_time: in doubt, keep.
+    inferred time and the conversation's update_time, or None (inside) if
+    update_time is unusable: in doubt, keep.
     """
-    inferred = _ancestor_time(mapping, node)
+    inferred = _ancestor_time(mapping, node, times)
     if inferred is None:
         inferred = updated if updated is not None else created
-    window_time = max((time for time in (inferred, updated) if time is not None), default=None)
-    return inferred, window_time
+    return inferred, None if updated is None else max(inferred, updated)
 
 
 def _content_text(content: Any) -> str:
@@ -222,9 +225,9 @@ def _message_fields(
     """(sort time, role, text, model, local time, kept reason), or None if hidden.
 
     Without a usable create_time, the window and sort order use the inferred
-    time, the local time is empty and the kept reason names the value's type.
-    A message whose time cannot be inferred at all counts as current, so it
-    sorts first. Raises _OutsideWindow for a message older than the cutoff.
+    time (at most the current time), the local time is empty and the kept
+    reason names the value's type. A message whose time cannot be inferred at
+    all counts as current, so it sorts first. Raises _OutsideWindow for a message older than the cutoff.
     """
     if not isinstance(message, dict):
         raise _FormatChange("invalid_message")
@@ -242,15 +245,16 @@ def _message_fields(
         value_type = type(message["create_time"]).__name__ if "create_time" in message else "absent"
         created, window_time = infer()
         if created is None:
-            created = window_time = current
+            created, window_time = current, None
             kept = f"timestamp_unknown_kept:{value_type}"
         else:
+            created = min(created, current)
             kept = f"timestamp_inferred:{value_type}"
     elif created > current:
         raise _Skip("future_timestamp")
     else:
         window_time = created
-    if cutoff is not None and window_time < cutoff:
+    if cutoff is not None and window_time is not None and window_time < cutoff:
         raise _OutsideWindow
     author = message.get("author")
     role = author.get("role") if isinstance(author, dict) else None
@@ -339,6 +343,7 @@ def extract_conversations(
             continue
         conversation_updated = _timestamp(conversation.get("update_time"))
         conversation_created = _timestamp(conversation.get("create_time"))
+        node_times: dict[str, datetime | None] = {}
         for message_position, node in enumerate(mapping.values(), start=1):
             if not isinstance(node, dict) or "message" not in node:
                 raise UnsupportedExportFormat("invalid_message", conversation_position, message_position)
@@ -348,7 +353,7 @@ def extract_conversations(
             try:
                 fields = _message_fields(
                     message, current, cutoff,
-                    lambda: _inferred_time(mapping, node, conversation_updated, conversation_created),
+                    lambda: _inferred_time(mapping, node, node_times, conversation_updated, conversation_created),
                 )
             except _FormatChange as error:
                 raise UnsupportedExportFormat(
@@ -369,8 +374,6 @@ def extract_conversations(
             if discarded_through is not None and key <= discarded_through:
                 outside_byte_limit += 1
                 continue
-            if kept is not None:
-                issue(conversation_position, message_position, kept, "message_kept")
             row = {
                 "conversation title": title,
                 "role": role,
@@ -384,6 +387,8 @@ def extract_conversations(
                 # one byte (two brackets minus the first row's absent comma).
                 size = len(json.dumps(row, ensure_ascii=False, separators=(",", ":")).encode("utf-8")) + 1
             row["_conversation"] = conversation_position - 1
+            # Reported after selection, so the byte budget can still exclude it.
+            row["_kept"] = None if kept is None else (conversation_position, message_position, kept)
             entry = (*key, size, row)
             if max_data_bytes is None:
                 rows.append(entry)
@@ -399,6 +404,9 @@ def extract_conversations(
                 # later, older small message could bypass an oversized newer one.
 
     rows.sort(reverse=True)
+    for *_, row in sorted(rows, key=lambda entry: -entry[1]):
+        if row["_kept"] is not None:
+            issue(*row["_kept"], "message_kept")
     return ExtractionResult(
         messages=pd.DataFrame([row[3] for row in rows], columns=[*MESSAGE_COLUMNS, "_conversation"]),
         issues=pd.DataFrame(issues, columns=ISSUE_COLUMNS, dtype=str),

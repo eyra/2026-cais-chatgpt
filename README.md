@@ -81,13 +81,15 @@ that accepts only the observed format and reports anything else ("fail soon"):
      is node-id order, not time order);
   2. else from the conversation's `update_time`, then its `create_time`.
 
-  It is outside the window only when its conversation's `update_time` is too,
-  so a reply in a resumed conversation is kept. If no time can be found, it
-  counts as current and is listed first, so the participant sees it and can
-  delete it. Its donated `time` is empty either way: no time is invented. The
-  tracking log counts these per reason, as `timestamp_inferred:<type>` or
-  `timestamp_unknown_kept:<type>` with action `message_kept`, where `<type>` is
-  the JSON type (`NoneType`, `str`, `float`, …) or `absent`, never the value.
+  It is outside the window only when its conversation's `update_time` is
+  usable and outside too, so a reply in a resumed conversation is kept. If no
+  time can be found, it counts as current and is listed first, so the
+  participant sees it and can delete it. Its donated `time` is empty either
+  way: no time is invented. The tracking log counts these per reason, as
+  `timestamp_inferred:<type>` or `timestamp_unknown_kept:<type>` with action
+  `message_kept`, where `<type>` is the JSON type (`NoneType`, `str`, `float`,
+  …) or `absent`, never the value. A message the byte budget excludes is
+  counted there instead.
   A message dated after the participant's clock is still skipped and counted
   as `future_timestamp`. Neither ever makes an export "unusable".
 - The table shows messages newest first. The time window is
@@ -95,8 +97,9 @@ that accepts only the observed format and reports anything else ("fail soon"):
   messages from the last 12 calendar months (UTC) before upload are offered for
   donation, as CAIS requested. `None` disables the month cutoff. The window
   used is recorded in the tracking donation, and the participant texts name it
-  ("from the last 12 months"). Messages are filtered by their own (or inferred) timestamp, so
-  a conversation that spans the cutoff contributes only its recent messages.
+  ("from the last 12 months"). Messages are filtered by their own (or
+  inferred) timestamp, so a conversation that spans the cutoff contributes
+  only its recent messages.
   The 200 MB donation byte budget applies independently, after the month window;
   with the window on, it only matters for very heavy recent use.
   A test release with another window can change only this value (CI builds a
@@ -113,8 +116,8 @@ that accepts only the observed format and reports anything else ("fail soon"):
 Two kinds of failure are handled differently:
 
 - **Format change** (fail soon): a field present on every conversation or
-  message has an unknown shape, e.g. a title that is no longer a string or
-  a missing `mapping` or `author.role` (never a timestamp, see above). Every message would be affected, so
+  message has an unknown shape, e.g. a title that is no longer a string or a
+  missing `mapping` or `author.role` (never a timestamp, see above). Every message would be affected, so
   extraction stops at the first occurrence and the export is rejected with a
   retry. The log names the reason code and position, so the script can be fixed
   and participants can be asked to donate again.

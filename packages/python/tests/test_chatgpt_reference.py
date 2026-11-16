@@ -318,11 +318,14 @@ def test_inferred_time_is_the_nearest_dated_ancestor_not_the_file_order():
         "a": child("c", None, content={"parts": ["reply"]}),
         "b": node(create_time=CREATED + 20, content={"parts": ["newest"]}),
         "c": child("d", "", content={"parts": ["undated parent"]}),
-        "d": child("root", CREATED + 10, content={"parts": ["dated grandparent"]}),
+        "d": child("f", CREATED + 10, content={"parts": ["dated grandparent"]}),
         "e": node(content={"parts": ["oldest"]}),
+        "f": child("root", CREATED + 30, content={"parts": ["farther, newer"]}),
         "root": {"message": None, "parent": None},
     }))
-    assert result.messages["message"].tolist() == ["newest", "reply", "undated parent", "dated grandparent", "oldest"]
+    assert result.messages["message"].tolist() == [
+        "farther, newer", "newest", "reply", "undated parent", "dated grandparent", "oldest",
+    ]
     assert result.issues[["message", "reason"]].to_dict("records") == [
         {"message": "1", "reason": "timestamp_inferred:NoneType"},
         {"message": "3", "reason": "timestamp_inferred:str"},
@@ -390,6 +393,37 @@ def test_byte_budget_still_applies_to_a_kept_undated_message():
     result = chatgpt.extract_conversations([source], now=NOW, max_data_bytes=budget)
     assert result.messages["message"].tolist() == ["small"]
     assert result.outside_byte_limit == 2
+    # Excluded by size, so not reported as kept.
+    assert result.issues.empty
+
+
+def test_inferred_old_time_is_kept_when_the_conversation_update_time_is_unusable():
+    result = extract(conversation({
+        "child": child("parent", None),
+        "parent": node(create_time=OLD),
+    }, update_time=None, create_time=OLD), window_months=12)
+    assert result.messages["message"].tolist() == ["Hello world"]
+    assert result.outside_window == 1
+
+
+def test_parent_cycle_ends_the_walk_and_falls_back_to_the_conversation_time():
+    result = extract(conversation({
+        "a": child("b", None, content={"parts": ["a"]}),
+        "b": child("a", None, content={"parts": ["b"]}),
+    }, update_time=CREATED))
+    assert result.messages["message"].tolist() == ["a", "b"]
+    assert result.issues["reason"].tolist() == ["timestamp_inferred:NoneType"] * 2
+
+
+def test_inferred_time_is_at_most_the_current_time():
+    # The future parent is skipped; its undated reply is kept, but never
+    # sorts above a message without any time (which counts as current).
+    result = extract(conversation({
+        "a-unknown": child("missing", None, content={"parts": ["unknown"]}),
+        "b-reply": child("c-future", None, content={"parts": ["reply"]}),
+        "c-future": node(create_time=NOW.timestamp() + 3600),
+    }))
+    assert result.messages["message"].tolist() == ["unknown", "reply"]
 
 
 @pytest.mark.parametrize("now", [NOW, NOW.replace(tzinfo=None), NOW.astimezone(timezone(timedelta(hours=5, minutes=30)))])

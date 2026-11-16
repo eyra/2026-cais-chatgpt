@@ -169,10 +169,9 @@ def extract_export(
 
 def processing_failures(extraction: chatgpt.ExtractionResult) -> bool:
     """Whether a message or conversation was excluded for a reason other than
-    its timestamp: kept messages and future timestamps never make an export
-    unusable."""
-    issues = extraction.issues
-    return bool(((issues["action"] != "message_kept") & (issues["reason"] != "future_timestamp")).any())
+    its timestamp. Kept messages are rows, and future timestamps never make an
+    export unusable."""
+    return bool((extraction.issues["reason"] != "future_timestamp").any())
 
 
 def window_label() -> str:
@@ -488,6 +487,6 @@ if __name__ == "__main__":
         dated = messages["time"][messages["time"] != ""]
         print(
             f"Would donate {len(messages)} messages from "
-            f"{messages['_conversation'].nunique()} conversations, "
-            f"{dated.min()} to {dated.max()}"
+            f"{messages['_conversation'].nunique()} conversations"
+            + (f", {dated.min()} to {dated.max()}" if len(dated) else "")
         )
