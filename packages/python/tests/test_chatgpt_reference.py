@@ -222,6 +222,18 @@ def test_unreadable_title_is_not_reported_when_no_message_is_donated():
     assert result.issues.empty
 
 
+def test_unreadable_title_is_not_reported_when_the_byte_budget_excludes_its_messages():
+    newer = conversation({"new": node(create_time=CREATED + 1)})
+    budget = donated_bytes(donated_rows(extract(newer)))
+    result = chatgpt.extract_conversations(
+        [newer, conversation({"old": node(content={"parts": ["large" * 100]})}, title=3)],
+        now=NOW, max_data_bytes=budget,
+    )
+    assert result.messages["message"].tolist() == ["Hello world"]
+    assert result.outside_byte_limit == 1
+    assert result.issues.empty
+
+
 def test_root_node_without_a_message_key_is_a_placeholder():
     result = extract(conversation({"root": {"parent": None, "children": ["turn"]}, "turn": node()}))
     assert result.messages["message"].tolist() == ["Hello world"]

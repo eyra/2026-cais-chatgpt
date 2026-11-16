@@ -31,7 +31,7 @@
 * Changed exports without messages in the time window to still reach the consent step, with a notice explaining the empty table, so the participant donates it instead of ending without a donation.
 * Added the Utrecht reference's tracking donation: the flow log, including rejections and skipped-message summaries, is donated as `<session>-tracking` at every step, whatever the consent decision, and forwarded as `CommandSystemLog` to the host (AppSignal). Logs contain positions and reason codes only, no participant text.
 * Added support for split exports: `conversations.json` files listed in `export_manifest.json` are read in order, one at a time alongside the byte-bounded retained messages.
-* Added archive safeguards: 256 MiB per JSON file, rejection of missing listed files, duplicate JSON keys, unreadable or excessively nested JSON, and text that cannot be serialized.
+* Added archive safeguards: 256 MiB per JSON file, rejection of missing listed files, duplicate JSON keys, unreadable or excessively nested JSON, and text that cannot be serialized. (Text that cannot be serialized is no longer a rejection; see the never-reject entries above.)
 * Fixed future-dated timestamps passing the twelve-month filter. (Superseded by the never-reject entries above.)
 * Removed `port/helpers.py` (reference fuzzy-matching helpers).
 * Changed the single CAIS table title to “Your conversations with ChatGPT” (with German and Dutch equivalents), without a part-number suffix.

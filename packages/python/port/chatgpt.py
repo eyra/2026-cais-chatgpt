@@ -42,8 +42,9 @@ EMPTY_TEXT_CONTENT_TYPES = frozenset({"thoughts", "reasoning_recap"})
 # Donated in place of each object or list part of a message, such as an image
 # asset pointer, so no file ids are donated.
 NON_TEXT_PART = "[image]"
-# Donated in place of a text part that cannot be read: a non-finite number, or
-# text that donation JSON cannot carry.
+# Donated in place of content or a text part that cannot be read: content that
+# is not an object with a list of parts, a non-finite number, or text that
+# donation JSON cannot carry.
 UNREADABLE_PART = "[unreadable]"
 
 
@@ -206,7 +207,7 @@ def _message_fields(
     whose time cannot be inferred at all, or that is dated in the future,
     counts as current for the window and the sort order; a future message
     keeps its own local time. Raises _OutsideWindow for a message older than
-    the cutoff, _Skip if nothing readable remains.
+    the cutoff, _Skip for an unknown content type.
     """
     kept: list[str] = []
     metadata = message.get("metadata")
