@@ -349,29 +349,62 @@ def test_partial_export_keeps_valid_messages_and_logs_one_summary(tmp_path, capl
     with caplog.at_level("WARNING", logger="port.script"):
         extraction, problem = script.extract_export(write_export(tmp_path, payload), now=NOW)
     assert problem is None
-    assert extraction.messages["message"].tolist() == ["Kept"]
+    assert extraction.messages["message"].tolist() == ["PRIVATE_TEXT", "Kept"]
     warnings = [record.getMessage() for record in caplog.records if record.name == "port.script"]
     assert warnings == [
-        "Processing issues: unknown_content_type:canvas message_excluded=2, future_timestamp message_excluded=1"
+        "Processing issues: unknown_content_type:canvas message_excluded=2, timestamp_future_kept message_kept=1"
     ]
 
 
-def test_format_change_rejects_export_and_logs_its_position(tmp_path, caplog):
+def roleless(entry: dict) -> dict:
+    entry["message"]["author"] = {"role": None}
+    return entry
+
+
+def test_format_change_keeps_the_message_and_logs_its_reason(tmp_path, caplog):
     payload = [
         conversation("Valid", [message("user", timestamp(2026, 9, 20), ["Kept"])]),
-        conversation("PRIVATE_TITLE", [message("user", "2026-09-20T12:00:00Z", ["PRIVATE_TEXT"])]),
+        conversation("PRIVATE_TITLE", [roleless(message("user", timestamp(2026, 9, 20), ["PRIVATE_TEXT"]))]),
     ]
     with caplog.at_level("WARNING", logger="port.script"):
-        assert script.extract_export(write_export(tmp_path, payload), now=NOW) == (None, "unsupported_format")
-    assert caplog.records[-1].getMessage() == (
-        "Rejected ChatGPT export: unsupported format, reason=invalid_timestamp:str conversation=2 message=1"
-    )
+        extraction, problem = script.extract_export(write_export(tmp_path, payload), now=NOW)
+    assert problem is None
+    assert extraction.messages[["role", "message"]].values.tolist() == [["user", "Kept"], ["", "PRIVATE_TEXT"]]
+    assert caplog.records[-1].getMessage() == "Processing issues: invalid_role:NoneType message_kept=1"
     assert "PRIVATE" not in caplog.text
 
 
-def test_export_with_only_skipped_messages_is_rejected(tmp_path):
+def test_export_with_only_skipped_messages_reaches_consent_with_an_empty_table(tmp_path, caplog):
     payload = [conversation("Failed", [canvas_message(timestamp(2026, 9, 20))])]
-    assert script.extract_export(write_export(tmp_path, payload), now=NOW) == (None, "unusable")
+    with caplog.at_level("INFO", logger="port.script"):
+        extraction, problem = script.extract_export(write_export(tmp_path, payload), now=NOW)
+    assert problem is None
+    assert extraction.messages.empty
+    assert "No messages to donate: no message could be read" in caplog.text
+
+
+def test_export_with_only_future_messages_reaches_consent_with_them(tmp_path):
+    # "Now" is the participant's clock; the message is donated as is.
+    payload = [conversation("Future", [message("user", timestamp(2026, 9, 22), ["Future"])])]
+    extraction, problem = script.extract_export(write_export(tmp_path, payload), now=NOW)
+    assert problem is None
+    assert extraction.messages["message"].tolist() == ["Future"]
+    assert extraction.messages["time"].tolist()[0] != ""
+    assert extraction.issues["reason"].tolist() == ["timestamp_future_kept"]
+
+
+@pytest.mark.parametrize("payload", [
+    [{"title": "PRIVATE_TITLE", "mapping": None}, "PRIVATE", None],
+    [conversation("Invalid", [{"message": ["PRIVATE"]}, "PRIVATE", {"message": None, "parent": "node-0"}])],
+])
+def test_export_without_any_readable_conversation_reaches_consent_not_rejected(tmp_path, caplog, payload):
+    with caplog.at_level("INFO", logger="port.script"):
+        extraction, problem = script.extract_export(write_export(tmp_path, payload), now=NOW)
+    assert problem is None
+    assert extraction.messages.empty
+    assert len(extraction.issues) == 3
+    assert "No messages to donate: no message could be read" in caplog.text
+    assert "PRIVATE" not in caplog.text
 
 
 @pytest.mark.parametrize("payload, outside_window", [
@@ -468,9 +501,9 @@ def test_undated_hidden_messages_and_root_placeholders_are_ignored(tmp_path):
 
 
 def unflagged_system_message() -> dict:
-    """Older export shape at message 2, the first node after the root
-    placeholder: an undated system message without the hidden flag. Publicly
-    described, not observed in our real exports (Flux 10507872361)."""
+    """Older export shape: an undated system message without the hidden flag.
+    Publicly described for older exports, not observed in our real exports
+    (Flux 10507872361)."""
     return {
         "message": {
             "author": {"role": "system", "name": None, "metadata": {}},
@@ -479,21 +512,23 @@ def unflagged_system_message() -> dict:
             "content": {"content_type": "text", "parts": [""]},
             "weight": 0.0,
             "metadata": {},
-        }
+        },
+        "parent": "node-0",
     }
 
 
 def old_format_conversation(title: str, created_at: float, text: str) -> dict:
-    return conversation(title, [
-        {"message": None, "parent": None},
-        unflagged_system_message(),
-        message("user", created_at, [text]),
-    ])
+    user = message("user", created_at, [text])
+    user["parent"] = "node-1"
+    entry = conversation(title, [{"message": None, "parent": None}, unflagged_system_message(), user])
+    entry.update(create_time=created_at, update_time=created_at)
+    return entry
 
 
-def test_undated_unflagged_system_message_is_skipped_not_rejected(tmp_path, caplog):
-    # Flux 10507872361: CAIS exports were rejected at message 2 with
-    # invalid_timestamp. The undated message is skipped and counted instead.
+def test_undated_unflagged_system_message_is_kept_not_rejected(tmp_path, caplog):
+    # Flux 10507872361: CAIS exports were rejected with invalid_timestamp
+    # (conversation 433, message 2: the second node by id). The undated
+    # message is kept with an empty time and counted instead.
     payload = [
         conversation("Recent", [
             {"message": None, "parent": None},
@@ -505,20 +540,23 @@ def test_undated_unflagged_system_message_is_skipped_not_rejected(tmp_path, capl
     with caplog.at_level("WARNING", logger="port.script"):
         extraction, problem = script.extract_export(write_export(tmp_path, payload), now=NOW)
     assert problem is None
-    assert extraction.messages["message"].tolist() == ["Recent", "PRIVATE_TEXT"]
+    assert extraction.messages[["role", "message"]].values.tolist() == [
+        ["user", "Recent"], ["system", ""], ["user", "PRIVATE_TEXT"],
+    ]
+    assert extraction.messages["time"].tolist()[1] == ""
     assert extraction.issues.to_dict("records") == [
-        {"conversation": "2", "message": "2", "reason": "missing_timestamp:NoneType", "action": "message_excluded"}
+        {"conversation": "2", "message": "2", "reason": "timestamp_inferred:NoneType", "action": "message_kept"}
     ]
     warnings = [record.getMessage() for record in caplog.records if record.name == "port.script"]
-    assert warnings == ["Processing issues: missing_timestamp:NoneType message_excluded=1"]
+    assert warnings == ["Processing issues: timestamp_inferred:NoneType message_kept=1"]
     assert "PRIVATE" not in caplog.text
 
 
 @pytest.mark.parametrize("window", [12, None])
-def test_undated_visible_message_is_skipped_whatever_the_window(tmp_path, monkeypatch, window):
-    # It cannot be placed inside or outside the window: it is skipped and counted.
+def test_undated_visible_message_is_kept_whatever_the_window(tmp_path, monkeypatch, window):
+    # Without a time to infer it counts as current: kept, first in the table.
     monkeypatch.setattr(script, "TIME_WINDOW_MONTHS", window)
-    absent = message("assistant", 0, ["Undated"])
+    absent = message("assistant", 0, ["Absent"])
     del absent["message"]["create_time"]
     payload = [conversation("Mixed", [
         message("user", timestamp(2026, 9, 20), ["Recent"]),
@@ -527,29 +565,57 @@ def test_undated_visible_message_is_skipped_whatever_the_window(tmp_path, monkey
     ])]
     extraction, problem = script.extract_export(write_export(tmp_path, payload), now=NOW)
     assert problem is None
-    assert extraction.messages["message"].tolist() == ["Recent"]
-    assert extraction.issues["reason"].tolist() == ["missing_timestamp:NoneType", "missing_timestamp:absent"]
+    assert extraction.messages["message"].tolist() == ["Undated", "Absent", "Recent"]
+    assert extraction.messages["time"].tolist()[:2] == ["", ""]
+    assert extraction.issues["reason"].tolist() == ["timestamp_unknown_kept:NoneType", "timestamp_unknown_kept:absent"]
 
 
-def test_old_export_with_undated_system_messages_still_reaches_consent(tmp_path, caplog):
+def test_old_export_with_undated_system_messages_reaches_consent_with_an_empty_table(tmp_path, caplog):
     payload = [old_format_conversation("PRIVATE_TITLE", timestamp(2023, 5, 1), "PRIVATE_TEXT")]
     with caplog.at_level("INFO", logger="port.script"):
         extraction, problem = script.extract_export(write_export(tmp_path, payload), now=NOW)
     assert problem is None
     assert extraction.messages.empty
-    assert extraction.outside_window == 1
-    assert (
-        "No messages to donate: all dated messages are outside the time window; undated messages were skipped"
-    ) in caplog.text
+    assert extraction.issues.empty
+    assert extraction.outside_window == 2
+    assert "No messages to donate: all messages are outside the time window" in caplog.text
 
 
-@pytest.mark.parametrize("payload", [
-    [conversation("Undated", [undated(message("user", 0, ["Undated"]))])],
-    [old_format_conversation("Mixed", timestamp(2023, 5, 1), "Old"),
-     conversation("Canvas", [canvas_message(timestamp(2026, 9, 20))])],
-])
-def test_export_with_only_undated_or_other_skipped_messages_is_unusable(tmp_path, payload):
-    assert script.extract_export(write_export(tmp_path, payload), now=NOW) == (None, "unusable")
+def test_export_with_only_undated_messages_reaches_consent_with_them(tmp_path):
+    payload = [conversation("Undated", [undated(message("user", 0, ["Undated"]))])]
+    extraction, problem = script.extract_export(write_export(tmp_path, payload), now=NOW)
+    assert problem is None
+    assert extraction.messages[["message", "time"]].values.tolist() == [["Undated", ""]]
+
+
+def test_export_with_only_old_or_skipped_messages_reaches_consent(tmp_path):
+    payload = [
+        old_format_conversation("Old", timestamp(2023, 5, 1), "Old"),
+        conversation("Canvas", [canvas_message(timestamp(2026, 9, 20))]),
+    ]
+    extraction, problem = script.extract_export(write_export(tmp_path, payload), now=NOW)
+    assert problem is None
+    assert extraction.messages.empty
+    assert extraction.outside_window == 2
+
+
+def test_unusable_timestamps_are_logged_by_type_without_values(tmp_path, caplog):
+    payload = [conversation("PRIVATE_TITLE", [
+        message("user", "PRIVATE_TIME 2026-09-20T12:00:00Z", ["PRIVATE_TEXT"]),
+        undated(message("assistant", 0, ["PRIVATE_TEXT"])),
+        message("user", timestamp(2026, 9, 20), ["PRIVATE_TEXT"]),
+    ])]
+    payload[0]["update_time"] = "PRIVATE_TIME"
+    with caplog.at_level("INFO", logger="port.script"):
+        extraction, problem = script.extract_export(write_export(tmp_path, payload), now=NOW)
+    assert problem is None
+    assert len(extraction.messages) == 3
+    warnings = [record.getMessage() for record in caplog.records if record.levelname == "WARNING"]
+    assert warnings == [
+        "Processing issues: timestamp_unknown_kept:str message_kept=1, timestamp_unknown_kept:NoneType message_kept=1"
+    ]
+    assert "PRIVATE" not in caplog.text
+    assert "PRIVATE" not in extraction.issues.to_json()
 
 
 FLOW = textwrap.dedent("""
@@ -604,13 +670,13 @@ def test_tracking_is_donated_whatever_the_consent_decision(tmp_path, consent):
     assert "PRIVATE" not in tracking
 
 
-def test_tracking_records_a_format_change_rejection(tmp_path):
-    payload = [conversation("PRIVATE_TITLE", [message("user", "2026-09-20T12:00:00Z", ["PRIVATE_TEXT"])])]
+def test_tracking_records_a_format_change_without_rejecting(tmp_path):
+    payload = [conversation("PRIVATE_TITLE", [roleless(message("user", timestamp(2026, 9, 20), ["PRIVATE_TEXT"]))])]
     donations = run_flow(write_export(tmp_path, payload))
-    assert {key for key, _ in donations} == {"s-tracking"}
+    assert {key for key, _ in donations} == {"s-tracking", "s-chatgpt-conversations"}
     tracking = "\n".join(donations[-1][1])
-    assert "unsupported format, reason=invalid_timestamp:str conversation=1 message=1" in tracking
-    assert "Skipped during retry flow" in tracking
+    assert "Processing issues: invalid_role:NoneType message_kept=1" in tracking
+    assert "Data donated" in tracking
     assert "PRIVATE" not in tracking
 
 

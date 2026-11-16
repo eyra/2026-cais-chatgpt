@@ -1,7 +1,7 @@
 """Public extraction contracts. Donated values mirror the Utrecht reference,
 verified message-by-message against real exports, except that an object or
-list part of a message (an image) is donated as a placeholder; only observed
-encodings are accepted."""
+list part of a message (an image) is donated as a placeholder; anything else
+is kept as far as it can be read, never rejected."""
 
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
@@ -129,13 +129,14 @@ def test_real_export_image_part_is_donated_as_a_placeholder_without_file_ids(par
     assert result.issues.empty
 
 
-def test_object_part_is_still_validated_before_it_is_replaced():
-    with pytest.raises(chatgpt.UnsupportedExportFormat) as raised:
-        extract(conversation({"bad": node(content={"parts": [{**IMAGE_PART, "width": float("nan")}]})}))
-    assert raised.value.reason == "invalid_content"
-    result = extract(conversation({"bad": node(content={"parts": [{**IMAGE_PART, "asset_pointer": "private\ud800value"}]}), "valid": node()}))
-    assert result.messages["message"].tolist() == ["Hello world"]
-    assert result.issues["reason"].tolist() == ["invalid_text"]
+def test_object_part_is_replaced_without_reading_its_fields():
+    # Its fields are never donated, so their values cannot make it unreadable.
+    result = extract(conversation({
+        "nan": node(content={"parts": [{**IMAGE_PART, "width": float("nan")}]}),
+        "surrogate": node(content={"parts": [{**IMAGE_PART, "asset_pointer": "private\ud800value"}]}),
+    }))
+    assert result.messages["message"].tolist() == ["[image]", "[image]"]
+    assert result.issues.empty
 
 
 @pytest.mark.parametrize("content", [
@@ -190,70 +191,126 @@ def test_false_hidden_flags_keep_messages(flag):
 
 
 @pytest.mark.parametrize("bad, reason", [
-    (None, "invalid_conversation"),
-    ({"title": 3, "mapping": {}}, "invalid_title"),
-    ({"title": None, "mapping": {}}, "invalid_title"),
-    ({"mapping": {}}, "invalid_title"),
-    ({"title": "t", "mapping": None}, "invalid_mapping"),
-    ({"title": "t"}, "invalid_mapping"),
+    (None, "invalid_conversation:NoneType"),
+    ("private", "invalid_conversation:str"),
+    ({"title": "t", "mapping": None}, "invalid_mapping:NoneType"),
+    ({"title": "t"}, "invalid_mapping:absent"),
 ])
-def test_conversation_format_change_rejects_export_at_first_occurrence(bad, reason):
-    consumed = []
+def test_conversation_without_readable_messages_is_excluded_not_rejected(bad, reason):
+    result = extract(conversation(), bad, conversation())
+    assert len(result.messages) == 2
+    assert result.issues.to_dict("records") == [
+        {"conversation": "2", "message": "", "reason": reason, "action": "conversation_excluded"}
+    ]
 
-    def export():
-        for item in (conversation(), bad, conversation()):
-            consumed.append(item)
-            yield item
 
-    with pytest.raises(chatgpt.UnsupportedExportFormat) as raised:
-        chatgpt.extract_conversations(export(), now=NOW)
-    assert (raised.value.reason, raised.value.conversation, raised.value.message) == (reason, 2, None)
-    # Fail soon: nothing after the format change is parsed.
-    assert len(consumed) == 2
+@pytest.mark.parametrize("title, reason", [
+    (3, "invalid_title:int"), (None, "invalid_title:NoneType"),
+    (["private"], "invalid_title:list"), ("private\ud800title", "invalid_text:title"),
+])
+def test_unreadable_title_keeps_the_conversation_with_an_empty_title(title, reason):
+    result = extract(conversation(title=title))
+    assert result.messages[["conversation title", "message"]].values.tolist() == [["", "Hello world"]]
+    assert result.issues.to_dict("records") == [
+        {"conversation": "1", "message": "", "reason": reason, "action": "conversation_kept"}
+    ]
+
+
+def test_unreadable_title_is_not_reported_when_no_message_is_donated():
+    result = extract(conversation({"old": node(create_time=OLD)}, title=3), window_months=12)
+    assert result.messages.empty
+    assert result.issues.empty
+
+
+def test_unreadable_title_is_not_reported_when_the_byte_budget_excludes_its_messages():
+    newer = conversation({"new": node(create_time=CREATED + 1)})
+    budget = donated_bytes(donated_rows(extract(newer)))
+    result = chatgpt.extract_conversations(
+        [newer, conversation({"old": node(content={"parts": ["large" * 100]})}, title=3)],
+        now=NOW, max_data_bytes=budget,
+    )
+    assert result.messages["message"].tolist() == ["Hello world"]
+    assert result.outside_byte_limit == 1
+    assert result.issues.empty
+
+
+def test_root_node_without_a_message_key_is_a_placeholder():
+    result = extract(conversation({"root": {"parent": None, "children": ["turn"]}, "turn": node()}))
+    assert result.messages["message"].tolist() == ["Hello world"]
+    assert result.issues.empty
+
+
+def test_missing_title_keeps_the_conversation_with_an_empty_title():
+    source = conversation()
+    del source["title"]
+    result = extract(source)
+    assert result.messages["conversation title"].tolist() == [""]
+    assert result.issues["reason"].tolist() == ["invalid_title:absent"]
 
 
 @pytest.mark.parametrize("bad, reason", [
-    (None, "invalid_message"), ({}, "invalid_message"),
-    ({"message": None, "parent": "parent-id"}, "invalid_message"),
-    ({"message": []}, "invalid_message"),
-    (node(metadata="private metadata"), "invalid_metadata"),
-    # Only booleans have been observed; other encodings are not guessed.
-    (node(metadata={"is_visually_hidden_from_conversation": "true"}), "invalid_hidden_flag"),
-    (node(metadata={"is_visually_hidden_from_conversation": 1}), "invalid_hidden_flag"),
-    (node(author=None), "invalid_role"),
-    (node(author={"role": None}), "invalid_role"),
-    (node(author={"role": 7}), "invalid_role"),
-    (node(metadata={"model_slug": []}), "invalid_model"),
-    (node(content=None), "invalid_content"),
-    (node(content={"parts": "not a list"}), "invalid_content"),
-    (node(content={"parts": ["valid prefix", float("nan")]}), "invalid_content"),
-    (node(create_time="2026-01-15T12:00:00Z"), "invalid_timestamp:str"),
+    (None, "invalid_message:NoneType"), ("private", "invalid_message:str"),
+    ({"parent": "parent-id"}, "invalid_message:absent"),
+    ({"message": None, "parent": "parent-id"}, "invalid_message:NoneType"),
+    ({"message": []}, "invalid_message:list"),
 ])
-def test_message_format_change_rejects_export_with_position_only(bad, reason):
-    with pytest.raises(chatgpt.UnsupportedExportFormat) as raised:
-        extract(conversation({"valid": node(), "bad": bad}))
-    assert (raised.value.reason, raised.value.conversation, raised.value.message) == (reason, 1, 2)
-    assert "private" not in str(raised.value)
+def test_node_without_a_message_object_is_excluded_not_rejected(bad, reason):
+    result = extract(conversation({"valid": node(), "bad": bad}))
+    assert result.messages["message"].tolist() == ["Hello world"]
+    assert result.issues.to_dict("records") == [
+        {"conversation": "1", "message": "2", "reason": reason, "action": "message_excluded"}
+    ]
+    assert "private" not in result.issues.to_json()
+
+
+def without_content():
+    value = node()
+    del value["message"]["content"]
+    return value
+
+
+@pytest.mark.parametrize("bad, row, reason", [
+    (node(content=None), ("user", "[unreadable]", "gpt-4"), "invalid_content:NoneType"),
+    (without_content(), ("user", "[unreadable]", "gpt-4"), "invalid_content:absent"),
+    (node(content="private"), ("user", "[unreadable]", "gpt-4"), "invalid_content:str"),
+    (node(content={"parts": "private"}), ("user", "[unreadable]", "gpt-4"), "invalid_content:str"),
+    (node(metadata="private"), ("user", "Hello world", ""), "invalid_metadata:str"),
+    # Only booleans have been observed; in doubt, the message is shown.
+    (node(metadata={"is_visually_hidden_from_conversation": "true"}), ("user", "Hello world", ""), "invalid_hidden_flag:str"),
+    (node(metadata={"is_visually_hidden_from_conversation": 1}), ("user", "Hello world", ""), "invalid_hidden_flag:int"),
+    (node(metadata={"is_visually_hidden_from_conversation": 0}), ("user", "Hello world", ""), "invalid_hidden_flag:int"),
+    (node(author=None), ("", "Hello world", "gpt-4"), "invalid_role:NoneType"),
+    (node(author={}), ("", "Hello world", "gpt-4"), "invalid_role:absent"),
+    (node(author={"role": None}), ("", "Hello world", "gpt-4"), "invalid_role:NoneType"),
+    (node(author={"role": 7}), ("", "Hello world", "gpt-4"), "invalid_role:int"),
+    (node(metadata={"model_slug": []}), ("user", "Hello world", ""), "invalid_model:list"),
+    (node(content={"parts": ["valid prefix ", float("nan")]}), ("user", "valid prefix [unreadable]", "gpt-4"), "invalid_content:float"),
+    (node(content={"parts": ["valid prefix ", "private\ud800value"]}), ("user", "valid prefix [unreadable]", "gpt-4"), "invalid_text:part"),
+])
+def test_unreadable_field_keeps_the_message_with_an_empty_field_or_placeholder(bad, row, reason):
+    result = extract(conversation({"bad": bad}))
+    assert result.messages[["role", "message", "model"]].values.tolist() == [list(row)]
+    assert result.issues.to_dict("records") == [
+        {"conversation": "1", "message": "1", "reason": reason, "action": "message_kept"}
+    ]
+
+
+def test_each_unreadable_field_of_a_message_is_reported_once():
+    bad = node(author={"role": 7}, metadata={"model_slug": 7}, content={"parts": [float("nan"), float("inf")]})
+    result = extract(conversation({"bad": bad}))
+    assert result.messages[["role", "message", "model"]].values.tolist() == [["", "[unreadable][unreadable]", ""]]
+    assert result.issues["reason"].tolist() == ["invalid_role:int", "invalid_model:int", "invalid_content:float"]
 
 
 @pytest.mark.parametrize("content, reason", [
     ({"content_type": "canvas", "text": "private"}, "unknown_content_type:canvas"),
     ({"text": "private"}, "unknown_content_type:other"),
     ({"content_type": "private free text!", "text": "x"}, "unknown_content_type:other"),
-    ({"parts": ["private\ud800value"]}, "invalid_text"),
 ])
 def test_unusable_message_is_skipped_and_reported_without_losing_siblings(content, reason):
     result = extract(conversation({"bad": node(content=content), "valid": node()}))
     assert result.messages["message"].tolist() == ["Hello world"]
     assert result.issues.to_dict("records") == [{"conversation": "1", "message": "1", "reason": reason, "action": "message_excluded"}]
-
-
-def test_null_or_missing_timestamp_is_skipped_and_reported_by_type():
-    missing = node()
-    del missing["message"]["create_time"]
-    result = extract(conversation({"null": node(create_time=None), "missing": missing, "valid": node()}))
-    assert result.messages["message"].tolist() == ["Hello world"]
-    assert result.issues["reason"].tolist() == ["missing_timestamp:NoneType", "missing_timestamp:absent"]
 
 
 def test_hidden_message_without_timestamp_key_is_ignored_without_issue():
@@ -272,29 +329,184 @@ def test_numeric_unix_seconds_are_the_supported_timestamp(timestamp, local_zone)
     assert result.issues.empty
 
 
+ABSENT = object()
+
+
+def child(parent, timestamp=CREATED, **overrides):
+    """A node linked to its parent; ABSENT removes create_time."""
+    value = node(create_time=timestamp, **overrides)
+    if timestamp is ABSENT:
+        del value["message"]["create_time"]
+    value["parent"] = parent
+    return value
+
+
+def times(result):
+    return result.messages["time"].tolist()
+
+
 @pytest.mark.parametrize("timestamp, value_type", [
-    (True, "bool"), ({}, "dict"), ("", "str"), (str(CREATED), "str"),
-    (CREATED * 1000, "float"), ("2026-01-15T12:00:00Z", "str"),
-    (float("nan"), "float"), (float("inf"), "float"), (float("-inf"), "float"), (1e30, "float"),
-    (-(10**400), "int"),
+    (None, "NoneType"), (ABSENT, "absent"), (True, "bool"), ({}, "dict"), ([], "list"),
+    ("", "str"), (str(CREATED), "str"), ("2026-01-15T12:00:00Z", "str"),
+    (CREATED * 1000, "float"), (float("nan"), "float"), (float("inf"), "float"),
+    (float("-inf"), "float"), (1e30, "float"), (-(10**400), "int"),
 ])
-def test_unobserved_timestamp_encodings_are_format_changes(timestamp, value_type):
-    # The reason names the type, so AppSignal shows the encoding without the value.
-    with pytest.raises(chatgpt.UnsupportedExportFormat) as raised:
-        extract(conversation({"bad": node(create_time=timestamp)}))
-    assert raised.value.reason == f"invalid_timestamp:{value_type}"
+def test_unusable_timestamp_keeps_the_message_with_an_empty_time(timestamp, value_type):
+    # Flux 10507872361: a timestamp problem never rejects the export or drops
+    # the message. The log names the type, never the value.
+    result = extract(conversation({
+        "bad": child("valid", timestamp, content={"parts": ["Undated"]}),
+        "valid": node(),
+    }))
+    assert result.messages["message"].tolist() == ["Undated", "Hello world"]
+    assert times(result)[0] == ""
+    assert result.issues.to_dict("records") == [
+        {"conversation": "1", "message": "1", "reason": f"timestamp_inferred:{value_type}", "action": "message_kept"}
+    ]
+
+
+def test_local_time_failure_is_an_unusable_timestamp(local_zone):
+    # Year 1 in UTC is a valid datetime, but not in a zone west of UTC.
+    local_zone("America/New_York")
+    result = extract(conversation({
+        "bad": child("valid", datetime(1, 1, 1, tzinfo=timezone.utc).timestamp(), content={"parts": ["Year 1"]}),
+        "valid": node(),
+    }))
+    assert result.messages["message"].tolist() == ["Year 1", "Hello world"]
+    assert times(result)[0] == ""
+    assert result.issues["reason"].tolist() == ["timestamp_inferred:float"]
+
+
+def test_inferred_time_is_the_nearest_dated_ancestor_not_the_file_order():
+    # Real exports sort nodes by id, so a parent often comes after its child.
+    # An undated parent is passed over for the dated grandparent.
+    result = extract(conversation({
+        "a": child("c", None, content={"parts": ["reply"]}),
+        "b": node(create_time=CREATED + 20, content={"parts": ["newest"]}),
+        "c": child("d", "", content={"parts": ["undated parent"]}),
+        "d": child("f", CREATED + 10, content={"parts": ["dated grandparent"]}),
+        "e": node(content={"parts": ["oldest"]}),
+        "f": child("root", CREATED + 30, content={"parts": ["farther, newer"]}),
+        "root": {"message": None, "parent": None},
+    }))
+    assert result.messages["message"].tolist() == [
+        "farther, newer", "newest", "reply", "undated parent", "dated grandparent", "oldest",
+    ]
+    assert result.issues[["message", "reason"]].to_dict("records") == [
+        {"message": "1", "reason": "timestamp_inferred:NoneType"},
+        {"message": "3", "reason": "timestamp_inferred:str"},
+    ]
+
+
+@pytest.mark.parametrize("conversation_times, order", [
+    ({"update_time": CREATED + 60, "create_time": CREATED - 60}, ["undated", "dated"]),
+    ({"update_time": None, "create_time": CREATED - 60}, ["dated", "undated"]),
+])
+def test_without_a_dated_ancestor_the_conversation_update_then_create_time_is_used(conversation_times, order):
+    result = extract(conversation({
+        "undated": child("root", None, content={"parts": ["undated"]}),
+        "dated": node(content={"parts": ["dated"]}),
+        "root": {"message": None, "parent": None},
+    }, **conversation_times))
+    assert result.messages["message"].tolist() == order
+    assert result.issues["reason"].tolist() == ["timestamp_inferred:NoneType"]
+
+
+def test_message_without_any_usable_time_is_kept_first_inside_the_window():
+    result = extract(conversation({
+        "dated": node(content={"parts": ["dated"]}),
+        "undated": child("missing-parent", None, content={"parts": ["undated"]}),
+    }, update_time="2026-01-15", create_time=None), window_months=12)
+    assert result.messages["message"].tolist() == ["undated", "dated"]
+    assert times(result)[0] == ""
+    assert result.issues.to_dict("records") == [
+        {"conversation": "1", "message": "2", "reason": "timestamp_unknown_kept:NoneType", "action": "message_kept"}
+    ]
+
+
+OLD = datetime(2020, 1, 1, tzinfo=timezone.utc).timestamp()
+
+
+def test_window_uses_the_inferred_time_and_old_messages_skip_content_parsing():
+    result = extract(conversation({
+        "child": child("parent", None, content={"unknown_format": "old"}),
+        "parent": node(create_time=OLD),
+    }, update_time=OLD, create_time=OLD), window_months=12)
+    assert result.messages.empty
+    assert result.issues.empty
+    assert result.outside_window == 2
+
+
+def test_inferred_old_time_is_kept_while_its_conversation_was_updated_in_the_window():
+    # In doubt, keep: a resumed conversation's undated reply to an old message.
+    result = extract(conversation({
+        "child": child("parent", None),
+        "parent": node(create_time=OLD),
+    }, update_time=CREATED, create_time=OLD), window_months=12)
+    assert result.messages["message"].tolist() == ["Hello world"]
+    assert result.outside_window == 1
+    assert result.issues["reason"].tolist() == ["timestamp_inferred:NoneType"]
+
+
+def test_byte_budget_still_applies_to_a_kept_undated_message():
+    small = conversation({"new": node(create_time=CREATED + 1, content={"parts": ["small"]})})
+    budget = donated_bytes(donated_rows(extract(small)))
+    source = conversation({
+        "large": child("old", None, content={"parts": ["large" * 100]}),
+        "new": node(create_time=CREATED + 1, content={"parts": ["small"]}),
+        "old": node(create_time=CREATED, content={"parts": ["old"]}),
+    })
+    result = chatgpt.extract_conversations([source], now=NOW, max_data_bytes=budget)
+    assert result.messages["message"].tolist() == ["small"]
+    assert result.outside_byte_limit == 2
+    # Excluded by size, so not reported as kept.
+    assert result.issues.empty
+
+
+def test_inferred_old_time_is_kept_when_the_conversation_update_time_is_unusable():
+    result = extract(conversation({
+        "child": child("parent", None),
+        "parent": node(create_time=OLD),
+    }, update_time=None, create_time=OLD), window_months=12)
+    assert result.messages["message"].tolist() == ["Hello world"]
+    assert result.outside_window == 1
+
+
+def test_parent_cycle_ends_the_walk_and_falls_back_to_the_conversation_time():
+    result = extract(conversation({
+        "a": child("b", None, content={"parts": ["a"]}),
+        "b": child("a", None, content={"parts": ["b"]}),
+    }, update_time=CREATED))
+    assert result.messages["message"].tolist() == ["a", "b"]
+    assert result.issues["reason"].tolist() == ["timestamp_inferred:NoneType"] * 2
+
+
+def test_inferred_time_is_at_most_the_current_time():
+    # An undated reply to a future message never sorts above a message
+    # without any time (which counts as current).
+    result = extract(conversation({
+        "a-unknown": child("missing", None, content={"parts": ["unknown"]}),
+        "b-reply": child("c-future", None, content={"parts": ["reply"]}),
+        "c-future": node(create_time=NOW.timestamp() + 3600),
+    }))
+    assert result.messages["message"].tolist() == ["unknown", "reply", "Hello world"]
 
 
 @pytest.mark.parametrize("now", [NOW, NOW.replace(tzinfo=None), NOW.astimezone(timezone(timedelta(hours=5, minutes=30)))])
-def test_utc_calendar_year_boundaries_are_inclusive_and_future_is_reported(now):
+def test_utc_calendar_year_boundaries_are_inclusive_and_future_is_kept(now, local_zone):
+    local_zone("UTC")
     cutoff = NOW.replace(year=NOW.year - 1)
     values = [
         ("old", cutoff - timedelta(microseconds=1)),
-        ("cutoff", cutoff), ("now", NOW), ("future", NOW + timedelta(microseconds=1)),
+        ("cutoff", cutoff), ("now", NOW), ("future", NOW + timedelta(days=1)),
     ]
     result = extract(conversation({name: node(create_time=value.timestamp(), content={"parts": [name]}) for name, value in values}), now=now, window_months=12)
-    assert result.messages["message"].tolist() == ["now", "cutoff"]
-    assert result.issues.to_dict("records") == [{"conversation": "1", "message": "4", "reason": "future_timestamp", "action": "message_excluded"}]
+    # A future message counts as current for the window and the order, and
+    # keeps its own time: "now" is the participant's clock.
+    assert result.messages[["message", "time"]].values.tolist() == [
+        ["now", "2026-09-24 12:00:00"], ["future", "2026-09-25 12:00:00"], ["cutoff", "2025-09-24 12:00:00"],
+    ]
+    assert result.issues.to_dict("records") == [{"conversation": "1", "message": "4", "reason": "timestamp_future_kept", "action": "message_kept"}]
 
 
 def test_leap_day_cutoff_falls_back_to_february_28_with_same_utc_time():
@@ -307,13 +519,13 @@ def test_leap_day_cutoff_falls_back_to_february_28_with_same_utc_time():
     assert result.issues.empty
 
 
-def test_depth_limit_is_a_format_change_not_partial_text():
-    leaf = "at boundary"
-    for _ in range(63):
+def test_deep_object_part_is_a_placeholder_not_a_rejection():
+    leaf = "private"
+    for _ in range(200):
         leaf = {"child": leaf}
-    assert extract(conversation({"valid": node(content={"parts": [leaf]})})).messages["message"].tolist() == ["[image]"]
-    with pytest.raises(chatgpt.UnsupportedExportFormat):
-        extract(conversation({"invalid": node(content={"parts": ["prefix", [leaf]]})}))
+    result = extract(conversation({"deep": node(content={"parts": ["prefix ", [leaf]]})}))
+    assert result.messages["message"].tolist() == ["prefix [image]"]
+    assert result.issues.empty
 
 
 def test_issue_locations_are_input_positions_and_never_contain_private_data(capsys, caplog):
@@ -325,11 +537,12 @@ def test_issue_locations_are_input_positions_and_never_contain_private_data(caps
         "valid": node(),
     }, title=private)
     result = extract(source, conversation(title="private\ud800title"))
-    assert result.messages["message"].tolist() == ["Hello world"]
+    assert result.messages["message"].tolist() == [private, "Hello world", "Hello world"]
+    assert result.messages["conversation title"].tolist() == [private, private, ""]
     assert result.issues.to_dict("records") == [
-        {"conversation": "1", "message": "2", "reason": "future_timestamp", "action": "message_excluded"},
+        {"conversation": "1", "message": "2", "reason": "timestamp_future_kept", "action": "message_kept"},
         {"conversation": "1", "message": "3", "reason": "unknown_content_type:canvas", "action": "message_excluded"},
-        {"conversation": "2", "message": "", "reason": "invalid_text", "action": "conversation_excluded"},
+        {"conversation": "2", "message": "", "reason": "invalid_text:title", "action": "conversation_kept"},
     ]
     assert "private" not in result.issues.to_json()
     captured = capsys.readouterr()
@@ -343,8 +556,10 @@ def test_extraction_does_not_mutate_the_export():
     assert source == original
 
 
-@pytest.mark.parametrize("field", ["title", "role", "model", "parts"])
-def test_invalid_unicode_is_reported_before_it_can_break_donation_json(field):
+@pytest.mark.parametrize("field, column, placeholder", [
+    ("title", "conversation title", ""), ("role", "role", ""), ("model", "model", ""), ("part", "message", "[unreadable]"),
+])
+def test_invalid_unicode_is_replaced_before_it_can_break_donation_json(field, column, placeholder):
     bad = conversation()
     message = bad["mapping"]["turn"]["message"]
     invalid = "private\ud800value"
@@ -356,11 +571,12 @@ def test_invalid_unicode_is_reported_before_it_can_break_donation_json(field):
         message["metadata"]["model_slug"] = invalid
     else:
         message["content"] = {"parts": [invalid]}
-    good = conversation({"turn": node(content={"parts": ["Exact text 😀 citeturn1"]})})
+    good = conversation({"turn": node(content={"parts": ["Exact text 😀 citeturn1"]})})
     result = extract(bad, good)
-    assert result.issues["reason"].tolist() == ["invalid_text"]
+    assert result.issues["reason"].tolist() == [f"invalid_text:{field}"]
     donated = json.loads(result.messages[chatgpt.MESSAGE_COLUMNS].to_json(orient="records"))
-    assert [row["message"] for row in donated] == ["Exact text 😀 citeturn1"]
+    assert [row[column] for row in donated][0] == placeholder
+    assert donated[1]["message"] == "Exact text 😀 citeturn1"
 
 
 def test_out_of_window_messages_do_not_need_content_parsing():

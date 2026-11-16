@@ -76,12 +76,12 @@ def process(data: dict[str, str]) -> Generator:
             yield donate_logs(tracking_key)
             return
 
-        extraction, problem = extract_export(file_result.value)
+        extraction, _ = extract_export(file_result.value)
         yield donate_logs(tracking_key)
         if extraction is not None:
             break
 
-        retry_result = yield render_data_submission_page([nothing_to_donate(problem)])
+        retry_result = yield render_data_submission_page([nothing_to_donate()])
         if retry_result.__type__ != "PayloadTrue":
             logger.info("Skipped during retry flow")
             yield donate_logs(tracking_key)
@@ -111,13 +111,14 @@ def extract_export(
 ) -> tuple[chatgpt.ExtractionResult | None, str | None]:
     """Return the extraction, or None and why the export cannot be used.
 
-    The reason is "unreadable", "unsupported_format", or "unusable" (processing
-    failures left no messages). An export without messages in the time window is returned
+    The only reason is "unreadable": the archive or its conversations JSON
+    cannot be read. A problem in a conversation or message never rejects the
+    export (Flux 10507872361). An export without messages to donate is returned
     normally: the participant still completes the consent step with an empty
-    table, which is informative for researchers too. Rejections, format changes
-    and skipped messages are logged as warnings, so they reach both the
-    tracking donation (researchers) and the host log (AppSignal). Skipped
-    messages are logged as one summary line with counts per reason and result.
+    table, which is informative for researchers too. Rejections and processing
+    issues are logged as warnings, so they reach both the tracking donation
+    (researchers) and the host log (AppSignal). Issues are logged as one
+    summary line with counts per reason and action.
     """
     logger.info("Time window: %s", window_label())
     try:
@@ -130,9 +131,6 @@ def extract_export(
     except InvalidChatGPTExport as error:
         logger.warning("Rejected ChatGPT export: %s", error)
         return None, "unreadable"
-    except chatgpt.UnsupportedExportFormat as error:
-        logger.warning("Rejected ChatGPT export: unsupported format, %s", error)
-        return None, "unsupported_format"
 
     if not extraction.issues.empty:
         counts = extraction.issues.value_counts(["reason", "action"], sort=False)
@@ -154,24 +152,13 @@ def extract_export(
     if extraction.messages.empty:
         if extraction.outside_byte_limit:
             logger.info("No messages to donate: the newest message exceeds the donation byte budget")
-        elif not extraction.issues.empty and not undated_only_beside_old(extraction):
-            logger.warning("Rejected ChatGPT export: processing failures left no messages in the time window")
-            return None, "unusable"
-        elif extraction.outside_window and extraction.issues.empty:
-            logger.info("No messages to donate: all messages are outside the time window")
         elif extraction.outside_window:
-            logger.info("No messages to donate: all dated messages are outside the time window; undated messages were skipped")
+            logger.info("No messages to donate: all messages are outside the time window")
+        elif (extraction.issues["action"].str.endswith("_excluded")).any():
+            logger.info("No messages to donate: no message could be read")
         else:
             logger.info("No messages to donate: the export contains no messages")
     return extraction, None
-
-
-def undated_only_beside_old(extraction: chatgpt.ExtractionResult) -> bool:
-    """Undated messages cannot be placed in the window; beside older dated
-    messages they do not make an export without recent messages unusable."""
-    return bool(extraction.outside_window) and bool(
-        extraction.issues["reason"].str.startswith("missing_timestamp:").all()
-    )
 
 
 def window_label() -> str:
@@ -312,27 +299,13 @@ def window_phrase() -> dict[str, str]:
     }
 
 
-def nothing_to_donate(problem: str | None) -> props.PropsUIPromptConfirm:
-    """Why the export cannot be used; ok retries with another file."""
-    within = window_phrase()
-    if problem == "unusable":
-        text = {
-            "en": f"Some records could not be processed, and no messages{within['en']} remain. Please select a different ZIP file.",
-            "de": f"Einige Datensätze konnten nicht verarbeitet werden, und es verbleiben keine Nachrichten{within['de']}. Bitte wählen Sie eine andere ZIP-Datei.",
-            "nl": f"Sommige gegevens konden niet worden verwerkt en er blijven geen berichten{within['nl']} over. Selecteer een ander ZIP-bestand.",
-        }
-    elif problem == "unsupported_format":
-        text = {
-            "en": "This ChatGPT export uses a format we do not support yet. Please email support@eyra.co and mention the study you are participating in. Do not attach your ChatGPT export or conversation contents.",
-            "de": "Dieser ChatGPT-Export verwendet ein Format, das wir noch nicht unterstützen. Bitte schreiben Sie eine E-Mail an support@eyra.co und nennen Sie die Studie, an der Sie teilnehmen. Fügen Sie weder Ihren ChatGPT-Export noch Gesprächsinhalte bei.",
-            "nl": "Deze ChatGPT-export gebruikt een formaat dat we nog niet ondersteunen. Stuur een e-mail naar support@eyra.co en vermeld aan welk onderzoek u deelneemt. Stuur uw ChatGPT-export of gespreksinhoud niet mee.",
-        }
-    else:
-        text = {
-            "en": "We could not read this ChatGPT export. Please select the unmodified ZIP file you received from ChatGPT.",
-            "de": "Dieser ChatGPT-Export konnte nicht gelesen werden. Bitte wählen Sie die unveränderte ZIP-Datei, die Sie von ChatGPT erhalten haben.",
-            "nl": "Deze ChatGPT-export kon niet worden gelezen. Selecteer het ongewijzigde ZIP-bestand dat u van ChatGPT hebt ontvangen.",
-        }
+def nothing_to_donate() -> props.PropsUIPromptConfirm:
+    """The export cannot be read; ok retries with another file."""
+    text = {
+        "en": "We could not read this ChatGPT export. Please select the unmodified ZIP file you received from ChatGPT.",
+        "de": "Dieser ChatGPT-Export konnte nicht gelesen werden. Bitte wählen Sie die unveränderte ZIP-Datei, die Sie von ChatGPT erhalten haben.",
+        "nl": "Deze ChatGPT-export kon niet worden gelezen. Selecteer het ongewijzigde ZIP-bestand dat u van ChatGPT hebt ontvangen.",
+    }
     return props.PropsUIPromptConfirm(
         props.Translatable(text),
         props.Translatable({"en": "Try again", "de": "Erneut versuchen", "nl": "Probeer opnieuw"}),
@@ -483,8 +456,10 @@ if __name__ == "__main__":
         print("Would donate an empty table: no messages in the time window")
     else:
         messages = extraction.messages
+        # Messages with an inferred time have an empty time.
+        dated = messages["time"][messages["time"] != ""]
         print(
             f"Would donate {len(messages)} messages from "
-            f"{messages['_conversation'].nunique()} conversations, "
-            f"{messages['time'].iloc[-1]} to {messages['time'].iloc[0]}"
+            f"{messages['_conversation'].nunique()} conversations"
+            + (f", {dated.min()} to {dated.max()}" if len(dated) else "")
         )
