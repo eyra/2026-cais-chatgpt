@@ -349,10 +349,10 @@ def test_partial_export_keeps_valid_messages_and_logs_one_summary(tmp_path, capl
     with caplog.at_level("WARNING", logger="port.script"):
         extraction, problem = script.extract_export(write_export(tmp_path, payload), now=NOW)
     assert problem is None
-    assert extraction.messages["message"].tolist() == ["Kept"]
+    assert extraction.messages["message"].tolist() == ["PRIVATE_TEXT", "Kept"]
     warnings = [record.getMessage() for record in caplog.records if record.name == "port.script"]
     assert warnings == [
-        "Processing issues: unknown_content_type:canvas message_excluded=2, future_timestamp message_excluded=1"
+        "Processing issues: unknown_content_type:canvas message_excluded=2, timestamp_future_kept message_kept=1"
     ]
 
 
@@ -361,32 +361,50 @@ def roleless(entry: dict) -> dict:
     return entry
 
 
-def test_format_change_rejects_export_and_logs_its_position(tmp_path, caplog):
+def test_format_change_keeps_the_message_and_logs_its_reason(tmp_path, caplog):
     payload = [
         conversation("Valid", [message("user", timestamp(2026, 9, 20), ["Kept"])]),
         conversation("PRIVATE_TITLE", [roleless(message("user", timestamp(2026, 9, 20), ["PRIVATE_TEXT"]))]),
     ]
     with caplog.at_level("WARNING", logger="port.script"):
-        assert script.extract_export(write_export(tmp_path, payload), now=NOW) == (None, "unsupported_format")
-    assert caplog.records[-1].getMessage() == (
-        "Rejected ChatGPT export: unsupported format, reason=invalid_role conversation=2 message=1"
-    )
+        extraction, problem = script.extract_export(write_export(tmp_path, payload), now=NOW)
+    assert problem is None
+    assert extraction.messages[["role", "message"]].values.tolist() == [["user", "Kept"], ["", "PRIVATE_TEXT"]]
+    assert caplog.records[-1].getMessage() == "Processing issues: invalid_role:NoneType message_kept=1"
     assert "PRIVATE" not in caplog.text
 
 
-def test_export_with_only_skipped_messages_is_rejected(tmp_path):
+def test_export_with_only_skipped_messages_reaches_consent_with_an_empty_table(tmp_path, caplog):
     payload = [conversation("Failed", [canvas_message(timestamp(2026, 9, 20))])]
-    assert script.extract_export(write_export(tmp_path, payload), now=NOW) == (None, "unusable")
-
-
-def test_export_with_only_future_messages_reaches_consent_not_unusable(tmp_path, caplog):
-    # A timestamp problem never rejects the export; the table is empty.
-    payload = [conversation("Future", [message("user", timestamp(2026, 9, 22), ["Future"])])]
     with caplog.at_level("INFO", logger="port.script"):
         extraction, problem = script.extract_export(write_export(tmp_path, payload), now=NOW)
     assert problem is None
     assert extraction.messages.empty
-    assert "No messages to donate: all messages have a future timestamp" in caplog.text
+    assert "No messages to donate: no message could be read" in caplog.text
+
+
+def test_export_with_only_future_messages_reaches_consent_with_them(tmp_path):
+    # "Now" is the participant's clock; the message is donated as is.
+    payload = [conversation("Future", [message("user", timestamp(2026, 9, 22), ["Future"])])]
+    extraction, problem = script.extract_export(write_export(tmp_path, payload), now=NOW)
+    assert problem is None
+    assert extraction.messages["message"].tolist() == ["Future"]
+    assert extraction.messages["time"].tolist()[0] != ""
+    assert extraction.issues["reason"].tolist() == ["timestamp_future_kept"]
+
+
+@pytest.mark.parametrize("payload", [
+    [{"title": "PRIVATE_TITLE", "mapping": None}, "PRIVATE", None],
+    [conversation("Invalid", [{"message": ["PRIVATE"]}, "PRIVATE", {"no message": True}])],
+])
+def test_export_without_any_readable_conversation_reaches_consent_not_rejected(tmp_path, caplog, payload):
+    with caplog.at_level("INFO", logger="port.script"):
+        extraction, problem = script.extract_export(write_export(tmp_path, payload), now=NOW)
+    assert problem is None
+    assert extraction.messages.empty
+    assert len(extraction.issues) == 3
+    assert "No messages to donate: no message could be read" in caplog.text
+    assert "PRIVATE" not in caplog.text
 
 
 @pytest.mark.parametrize("payload, outside_window", [
@@ -570,12 +588,15 @@ def test_export_with_only_undated_messages_reaches_consent_with_them(tmp_path):
     assert extraction.messages[["message", "time"]].values.tolist() == [["Undated", ""]]
 
 
-def test_export_with_only_old_or_non_timestamp_skipped_messages_is_unusable(tmp_path):
+def test_export_with_only_old_or_skipped_messages_reaches_consent(tmp_path):
     payload = [
         old_format_conversation("Old", timestamp(2023, 5, 1), "Old"),
         conversation("Canvas", [canvas_message(timestamp(2026, 9, 20))]),
     ]
-    assert script.extract_export(write_export(tmp_path, payload), now=NOW) == (None, "unusable")
+    extraction, problem = script.extract_export(write_export(tmp_path, payload), now=NOW)
+    assert problem is None
+    assert extraction.messages.empty
+    assert extraction.outside_window == 2
 
 
 def test_unusable_timestamps_are_logged_by_type_without_values(tmp_path, caplog):
@@ -649,13 +670,13 @@ def test_tracking_is_donated_whatever_the_consent_decision(tmp_path, consent):
     assert "PRIVATE" not in tracking
 
 
-def test_tracking_records_a_format_change_rejection(tmp_path):
+def test_tracking_records_a_format_change_without_rejecting(tmp_path):
     payload = [conversation("PRIVATE_TITLE", [roleless(message("user", timestamp(2026, 9, 20), ["PRIVATE_TEXT"]))])]
     donations = run_flow(write_export(tmp_path, payload))
-    assert {key for key, _ in donations} == {"s-tracking"}
+    assert {key for key, _ in donations} == {"s-tracking", "s-chatgpt-conversations"}
     tracking = "\n".join(donations[-1][1])
-    assert "unsupported format, reason=invalid_role conversation=1 message=1" in tracking
-    assert "Skipped during retry flow" in tracking
+    assert "Processing issues: invalid_role:NoneType message_kept=1" in tracking
+    assert "Data donated" in tracking
     assert "PRIVATE" not in tracking
 
 

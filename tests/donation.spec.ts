@@ -188,12 +188,13 @@ test('preserves Unicode and control characters through review and donation', asy
 });
 
 test('skips unusable messages and reports them only in the tracking donation', async ({ page }) => {
+  const futureTimestamp = (referenceDay + 7 * day) / 1000;
   const donations = await uploadChatGPTExport(page, [{
     title: secretTitle,
     mapping: {
       valid: messageNode('Newest answer', newestTimestamp),
       canvas: messageNode(secretText, newestTimestamp, { content_type: 'canvas', text: secretText }),
-      future: messageNode(secretText, (referenceDay + 7 * day) / 1000),
+      future: messageNode('Future answer', futureTimestamp),
     },
   }]);
 
@@ -202,10 +203,14 @@ test('skips unusable messages and reports them only in the tracking donation', a
 
   const { tables, tracking, raw } = await submitDonation(page, donations);
   expect(Object.keys(tables)).toEqual(['chatgpt_conversations_1']);
-  expect(tables.chatgpt_conversations_1.data).toEqual([{ ...newestRow, 'conversation title': secretTitle }]);
+  // A future message counts as current and keeps its own time.
+  expect(tables.chatgpt_conversations_1.data).toEqual([
+    { ...newestRow, 'conversation title': secretTitle, message: 'Future answer', time: localTime(futureTimestamp) },
+    { ...newestRow, 'conversation title': secretTitle },
+  ]);
   expect(tracking).toContain('Processing issues: ');
   expect(tracking).toContain('unknown_content_type:canvas message_excluded=1');
-  expect(tracking).toContain('future_timestamp message_excluded=1');
+  expect(tracking).toContain('timestamp_future_kept message_kept=1');
   expect(raw).not.toContain(secretText);
 });
 
@@ -255,26 +260,19 @@ test('explains an empty table when no messages are from the last 12 months', asy
   expect(raw).not.toContain('SECRET');
 });
 
-test('rejects a changed export format at once and tracks the reason', async ({ page }) => {
-  const donations = await openDonation(page);
-  await chooseExport(page, exportFile([
+test('keeps a conversation with a changed title format and tracks the reason', async ({ page }) => {
+  const donations = await uploadChatGPTExport(page, [
     { title: secretTitle, mapping: { valid: messageNode('Newest answer', newestTimestamp) } },
-    { title: 7, mapping: { changed: messageNode(secretText, newestTimestamp) } },
-  ]));
+    { title: 7, mapping: { changed: messageNode('Changed format', newestTimestamp) } },
+  ]);
 
-  await expect(page.getByRole('button', { name: 'Try again' })).toBeVisible();
-  await expect(page.getByText('Yes, donate', { exact: true })).not.toBeVisible();
-  await expect.poll(() => latestTracking(donations))
-    .toContain('unsupported format, reason=invalid_title conversation=2');
-  expect(JSON.stringify(donations)).not.toContain('SECRET');
-
-  await page.getByRole('button', { name: 'Try again' }).click();
-  await chooseExport(page, exportFile(fixtureConversations));
-  await expect(page.getByTestId('table-chatgpt_conversations_1')).toBeVisible();
-
-  const { tables } = await submitDonation(page, donations);
-  expect(Object.keys(tables)).toEqual(['chatgpt_conversations_1']);
-  expect(tables.chatgpt_conversations_1.data).toEqual([newestRow, questionRow]);
+  const { tables, tracking } = await submitDonation(page, donations);
+  expect(tables.chatgpt_conversations_1.data).toEqual([
+    { ...newestRow, 'conversation title': secretTitle },
+    { ...newestRow, 'conversation title': '', message: 'Changed format' },
+  ]);
+  expect(tracking).toContain('invalid_title:int conversation_kept=1');
+  expect(tracking).not.toContain('SECRET');
 });
 
 test('rejects an invalid ZIP and returns to file selection', async ({ page }) => {

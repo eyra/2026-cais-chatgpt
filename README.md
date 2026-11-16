@@ -54,7 +54,8 @@ The five donated fields (`conversation title`, `role`, `message`, `model`,
 (AGPL-3.0). Donated values mirror the reference: on four real exports
 (August 2026), every message produced the same row as the unmodified reference
 extractor. The reference's fuzzy key matching is replaced by explicit parsing
-that accepts only the observed format and reports anything else ("fail soon"):
+that reads only the observed format and reports anything else, without
+rejecting the export (see "Processing issues" below):
 
 - `packages/python/port/chatgpt.py` reads only `title`, `message.author.role`,
   `message.metadata.model_slug`, `message.create_time`, the hidden flag and
@@ -67,9 +68,10 @@ that accepts only the observed format and reports anything else ("fail soon"):
   message. One deviation: each object or list part, such as an image pointer,
   is donated as `[image]` instead of its flattened fields, so no file ids are
   donated.
-- Only observed encodings are accepted: the hidden flag as a boolean (normally
-  absent), titles as strings. Absent model or metadata (user messages) is an
-  empty model. Timestamps are the exception: see the next point.
+- Only observed encodings are read: the hidden flag as a boolean (normally
+  absent), titles, roles and models as strings, parts as a list. Absent model
+  or metadata (user messages) is an empty model. Anything else is a
+  processing issue (below); timestamps are described in the next point.
 - A timestamp problem never rejects the export or drops a message (Flux
   10507872361). Hidden messages (such as the system prompt) and empty root
   placeholders are skipped before the timestamp is read, as before. A visible
@@ -90,8 +92,10 @@ that accepts only the observed format and reports anything else ("fail soon"):
   `message_kept`, where `<type>` is the JSON type (`NoneType`, `str`, `float`,
   …) or `absent`, never the value. A message the byte budget excludes is
   counted there instead.
-  A message dated after the participant's clock is still skipped and counted
-  as `future_timestamp`. Neither ever makes an export "unusable".
+  A message dated after the participant's clock is kept and donated with its
+  own time; for the window and the order it counts as current, because "now"
+  is the participant's clock, which may be wrong. It is counted as
+  `timestamp_future_kept`.
 - The table shows messages newest first. The time window is
   `TIME_WINDOW_MONTHS` in `port/script.py`, currently set to **`12`**: only
   messages from the last 12 calendar months (UTC) before upload are offered for
@@ -113,27 +117,43 @@ that accepts only the observed format and reports anything else ("fail soon"):
   Each file must be at most 256 MiB of readable UTF-8 JSON without duplicate
   keys. A missing listed file or unreadable JSON rejects the export with a retry.
 
-Two kinds of failure are handled differently:
+Only an archive that cannot be read rejects the export with a retry: not a
+ZIP, no (or more than one) `conversations.json` without a manifest, a listed
+file that is missing, a file over 256 MiB, JSON that cannot be parsed or has
+duplicate keys, or a conversations file that is not a list. Nothing in it can
+be read, so there is nothing to show the participant.
 
-- **Format change** (fail soon): a field present on every conversation or
-  message has an unknown shape, e.g. a title that is no longer a string or a
-  missing `mapping` or `author.role` (never a timestamp, see above). Every message would be affected, so
-  extraction stops at the first occurrence and the export is rejected with a
-  retry. The log names the reason code and position, so the script can be fixed
-  and participants can be asked to donate again.
-- **Unusable single message**: an unknown content type without `parts`, a
-  timestamp in the future (device clock), or text that cannot be serialized.
-  Only that message is skipped; extraction continues. If skipped messages leave
-  nothing to donate, the export is rejected with a retry, unless they were
-  only skipped for a future timestamp.
+A problem in a conversation or message never rejects the export (Flux
+10507872361): what is readable is kept, nothing is invented, and nothing is
+dropped without being counted.
 
-Both are logged as warnings without titles, text or export IDs. Skipped
-messages are logged as one summary line with counts per reason, e.g.
+- **Kept with an empty field or a placeholder** (`message_kept`,
+  `conversation_kept`): a title, role or model that is not a string, or text
+  that donation JSON cannot carry (an isolated surrogate), becomes empty
+  (`invalid_title:<type>`, `invalid_role:<type>`, `invalid_model:<type>`,
+  `invalid_text:<field>`). Metadata that is not an object is read as empty,
+  and a hidden flag that is not a boolean as "not hidden", so the participant
+  sees the message (`invalid_metadata:<type>`, `invalid_hidden_flag:<type>`).
+  A text part that cannot be read (a non-finite number, an isolated
+  surrogate) becomes `[unreadable]`; the other parts are kept. Object and list
+  parts are `[image]` whatever their fields, which are never read. Messages
+  with an unusable or future timestamp are kept as described above.
+- **Skipped** (`message_excluded`, `conversation_excluded`), because nothing
+  readable remains: a conversation that is not an object or has no `mapping`
+  object (`invalid_conversation:<type>`, `invalid_mapping:<type>`), a node
+  without a message object (`invalid_message:<type>`), or content that is not
+  an object with a list of parts (`invalid_content:<type>`), including an
+  unknown content type without `parts` (`unknown_content_type:<label>`). Only
+  that message or conversation is skipped. If nothing remains, the participant
+  still reaches the consent step with an empty table.
+
+Issues are logged as warnings without titles, text, values or export IDs:
+one summary line with counts per reason and action, e.g.
 `Processing issues: unknown_content_type:canvas message_excluded=3`. Every log
 line reaches two channels:
 
 - the host log (`CommandSystemLog`, forwarded by Next to AppSignal), so Eyra
-  sees format changes early;
+  sees format changes early, without participants being turned away;
 - the tracking donation `<session>-tracking`, as in the Utrecht reference
   (`donate_logs`): the flow log is donated at every step, whatever the consent
   decision, so researchers can account for skipped messages in their analysis.
