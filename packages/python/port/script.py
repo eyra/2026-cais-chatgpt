@@ -112,9 +112,10 @@ def extract_export(
     """Return the extraction, or None and why the export cannot be used.
 
     The reason is "unreadable", "unsupported_format", or "unusable" (processing
-    failures left no messages). An export without messages in the time window is returned
-    normally: the participant still completes the consent step with an empty
-    table, which is informative for researchers too. Rejections, format changes
+    failures left no messages); a timestamp problem is never one of them. An
+    export without messages in the time window is returned normally: the
+    participant still completes the consent step with an empty table, which is
+    informative for researchers too. Rejections, format changes
     and skipped messages are logged as warnings, so they reach both the
     tracking donation (researchers) and the host log (AppSignal). Skipped
     messages are logged as one summary line with counts per reason and result.
@@ -154,24 +155,24 @@ def extract_export(
     if extraction.messages.empty:
         if extraction.outside_byte_limit:
             logger.info("No messages to donate: the newest message exceeds the donation byte budget")
-        elif not extraction.issues.empty and not undated_only_beside_old(extraction):
+        elif processing_failures(extraction):
             logger.warning("Rejected ChatGPT export: processing failures left no messages in the time window")
             return None, "unusable"
-        elif extraction.outside_window and extraction.issues.empty:
-            logger.info("No messages to donate: all messages are outside the time window")
         elif extraction.outside_window:
-            logger.info("No messages to donate: all dated messages are outside the time window; undated messages were skipped")
+            logger.info("No messages to donate: all messages are outside the time window")
+        elif not extraction.issues.empty:
+            logger.info("No messages to donate: all messages have a future timestamp")
         else:
             logger.info("No messages to donate: the export contains no messages")
     return extraction, None
 
 
-def undated_only_beside_old(extraction: chatgpt.ExtractionResult) -> bool:
-    """Undated messages cannot be placed in the window; beside older dated
-    messages they do not make an export without recent messages unusable."""
-    return bool(extraction.outside_window) and bool(
-        extraction.issues["reason"].str.startswith("missing_timestamp:").all()
-    )
+def processing_failures(extraction: chatgpt.ExtractionResult) -> bool:
+    """Whether a message or conversation was excluded for a reason other than
+    its timestamp: kept messages and future timestamps never make an export
+    unusable."""
+    issues = extraction.issues
+    return bool(((issues["action"] != "message_kept") & (issues["reason"] != "future_timestamp")).any())
 
 
 def window_label() -> str:
@@ -483,8 +484,10 @@ if __name__ == "__main__":
         print("Would donate an empty table: no messages in the time window")
     else:
         messages = extraction.messages
+        # Messages with an inferred time have an empty time.
+        dated = messages["time"][messages["time"] != ""]
         print(
             f"Would donate {len(messages)} messages from "
             f"{messages['_conversation'].nunique()} conversations, "
-            f"{messages['time'].iloc[-1]} to {messages['time'].iloc[0]}"
+            f"{dated.min()} to {dated.max()}"
         )

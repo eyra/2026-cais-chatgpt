@@ -227,7 +227,6 @@ def test_conversation_format_change_rejects_export_at_first_occurrence(bad, reas
     (node(content=None), "invalid_content"),
     (node(content={"parts": "not a list"}), "invalid_content"),
     (node(content={"parts": ["valid prefix", float("nan")]}), "invalid_content"),
-    (node(create_time="2026-01-15T12:00:00Z"), "invalid_timestamp:str"),
 ])
 def test_message_format_change_rejects_export_with_position_only(bad, reason):
     with pytest.raises(chatgpt.UnsupportedExportFormat) as raised:
@@ -248,14 +247,6 @@ def test_unusable_message_is_skipped_and_reported_without_losing_siblings(conten
     assert result.issues.to_dict("records") == [{"conversation": "1", "message": "1", "reason": reason, "action": "message_excluded"}]
 
 
-def test_null_or_missing_timestamp_is_skipped_and_reported_by_type():
-    missing = node()
-    del missing["message"]["create_time"]
-    result = extract(conversation({"null": node(create_time=None), "missing": missing, "valid": node()}))
-    assert result.messages["message"].tolist() == ["Hello world"]
-    assert result.issues["reason"].tolist() == ["missing_timestamp:NoneType", "missing_timestamp:absent"]
-
-
 def test_hidden_message_without_timestamp_key_is_ignored_without_issue():
     hidden = node(metadata={"is_visually_hidden_from_conversation": True})
     del hidden["message"]["create_time"]
@@ -272,17 +263,133 @@ def test_numeric_unix_seconds_are_the_supported_timestamp(timestamp, local_zone)
     assert result.issues.empty
 
 
+ABSENT = object()
+
+
+def child(parent, timestamp=CREATED, **overrides):
+    """A node linked to its parent; ABSENT removes create_time."""
+    value = node(create_time=timestamp, **overrides)
+    if timestamp is ABSENT:
+        del value["message"]["create_time"]
+    value["parent"] = parent
+    return value
+
+
+def times(result):
+    return result.messages["time"].tolist()
+
+
 @pytest.mark.parametrize("timestamp, value_type", [
-    (True, "bool"), ({}, "dict"), ("", "str"), (str(CREATED), "str"),
-    (CREATED * 1000, "float"), ("2026-01-15T12:00:00Z", "str"),
-    (float("nan"), "float"), (float("inf"), "float"), (float("-inf"), "float"), (1e30, "float"),
-    (-(10**400), "int"),
+    (None, "NoneType"), (ABSENT, "absent"), (True, "bool"), ({}, "dict"), ([], "list"),
+    ("", "str"), (str(CREATED), "str"), ("2026-01-15T12:00:00Z", "str"),
+    (CREATED * 1000, "float"), (float("nan"), "float"), (float("inf"), "float"),
+    (float("-inf"), "float"), (1e30, "float"), (-(10**400), "int"),
 ])
-def test_unobserved_timestamp_encodings_are_format_changes(timestamp, value_type):
-    # The reason names the type, so AppSignal shows the encoding without the value.
-    with pytest.raises(chatgpt.UnsupportedExportFormat) as raised:
-        extract(conversation({"bad": node(create_time=timestamp)}))
-    assert raised.value.reason == f"invalid_timestamp:{value_type}"
+def test_unusable_timestamp_keeps_the_message_with_an_empty_time(timestamp, value_type):
+    # Flux 10507872361: a timestamp problem never rejects the export or drops
+    # the message. The log names the type, never the value.
+    result = extract(conversation({
+        "bad": child("valid", timestamp, content={"parts": ["Undated"]}),
+        "valid": node(),
+    }))
+    assert result.messages["message"].tolist() == ["Undated", "Hello world"]
+    assert times(result)[0] == ""
+    assert result.issues.to_dict("records") == [
+        {"conversation": "1", "message": "1", "reason": f"timestamp_inferred:{value_type}", "action": "message_kept"}
+    ]
+
+
+def test_local_time_failure_is_an_unusable_timestamp(local_zone):
+    # Year 1 in UTC is a valid datetime, but not in a zone west of UTC.
+    local_zone("America/New_York")
+    result = extract(conversation({
+        "bad": child("valid", datetime(1, 1, 1, tzinfo=timezone.utc).timestamp(), content={"parts": ["Year 1"]}),
+        "valid": node(),
+    }))
+    assert result.messages["message"].tolist() == ["Year 1", "Hello world"]
+    assert times(result)[0] == ""
+    assert result.issues["reason"].tolist() == ["timestamp_inferred:float"]
+
+
+def test_inferred_time_is_the_nearest_dated_ancestor_not_the_file_order():
+    # Real exports sort nodes by id, so a parent often comes after its child.
+    # An undated parent is passed over for the dated grandparent.
+    result = extract(conversation({
+        "a": child("c", None, content={"parts": ["reply"]}),
+        "b": node(create_time=CREATED + 20, content={"parts": ["newest"]}),
+        "c": child("d", "", content={"parts": ["undated parent"]}),
+        "d": child("root", CREATED + 10, content={"parts": ["dated grandparent"]}),
+        "e": node(content={"parts": ["oldest"]}),
+        "root": {"message": None, "parent": None},
+    }))
+    assert result.messages["message"].tolist() == ["newest", "reply", "undated parent", "dated grandparent", "oldest"]
+    assert result.issues[["message", "reason"]].to_dict("records") == [
+        {"message": "1", "reason": "timestamp_inferred:NoneType"},
+        {"message": "3", "reason": "timestamp_inferred:str"},
+    ]
+
+
+@pytest.mark.parametrize("conversation_times, order", [
+    ({"update_time": CREATED + 60, "create_time": CREATED - 60}, ["undated", "dated"]),
+    ({"update_time": None, "create_time": CREATED - 60}, ["dated", "undated"]),
+])
+def test_without_a_dated_ancestor_the_conversation_update_then_create_time_is_used(conversation_times, order):
+    result = extract(conversation({
+        "undated": child("root", None, content={"parts": ["undated"]}),
+        "dated": node(content={"parts": ["dated"]}),
+        "root": {"message": None, "parent": None},
+    }, **conversation_times))
+    assert result.messages["message"].tolist() == order
+    assert result.issues["reason"].tolist() == ["timestamp_inferred:NoneType"]
+
+
+def test_message_without_any_usable_time_is_kept_first_inside_the_window():
+    result = extract(conversation({
+        "dated": node(content={"parts": ["dated"]}),
+        "undated": child("missing-parent", None, content={"parts": ["undated"]}),
+    }, update_time="2026-01-15", create_time=None), window_months=12)
+    assert result.messages["message"].tolist() == ["undated", "dated"]
+    assert times(result)[0] == ""
+    assert result.issues.to_dict("records") == [
+        {"conversation": "1", "message": "2", "reason": "timestamp_unknown_kept:NoneType", "action": "message_kept"}
+    ]
+
+
+OLD = datetime(2020, 1, 1, tzinfo=timezone.utc).timestamp()
+
+
+def test_window_uses_the_inferred_time_and_old_messages_skip_content_parsing():
+    result = extract(conversation({
+        "child": child("parent", None, content={"unknown_format": "old"}),
+        "parent": node(create_time=OLD),
+    }, update_time=OLD, create_time=OLD), window_months=12)
+    assert result.messages.empty
+    assert result.issues.empty
+    assert result.outside_window == 2
+
+
+def test_inferred_old_time_is_kept_while_its_conversation_was_updated_in_the_window():
+    # In doubt, keep: a resumed conversation's undated reply to an old message.
+    result = extract(conversation({
+        "child": child("parent", None),
+        "parent": node(create_time=OLD),
+    }, update_time=CREATED, create_time=OLD), window_months=12)
+    assert result.messages["message"].tolist() == ["Hello world"]
+    assert result.outside_window == 1
+    assert result.issues["reason"].tolist() == ["timestamp_inferred:NoneType"]
+
+
+def test_byte_budget_still_applies_to_a_kept_undated_message():
+    small = conversation({"new": node(create_time=CREATED + 1, content={"parts": ["small"]})})
+    budget = donated_bytes(donated_rows(extract(small)))
+    source = conversation({
+        "large": child("old", None, content={"parts": ["large" * 100]}),
+        "new": node(create_time=CREATED + 1, content={"parts": ["small"]}),
+        "old": node(create_time=CREATED, content={"parts": ["old"]}),
+    })
+    result = chatgpt.extract_conversations([source], now=NOW, max_data_bytes=budget)
+    assert result.messages["message"].tolist() == ["small"]
+    assert result.outside_byte_limit == 2
 
 
 @pytest.mark.parametrize("now", [NOW, NOW.replace(tzinfo=None), NOW.astimezone(timezone(timedelta(hours=5, minutes=30)))])

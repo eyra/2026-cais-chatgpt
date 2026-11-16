@@ -11,13 +11,19 @@ Two kinds of failure are distinguished:
 - A field present on every conversation or message has an unknown shape: the
   export format changed. Extraction stops at the first occurrence by raising
   UnsupportedExportFormat, so the change is noticed immediately.
-- A single message cannot be used (unknown content type, missing or null
-  timestamp, future timestamp, unserializable text): it is skipped and
-  reported as an issue; extraction continues.
+- A single message cannot be used (unknown content type, future timestamp,
+  unserializable text): it is skipped and reported as an issue; extraction
+  continues.
+
+A timestamp problem never rejects the export or drops a message (Flux
+10507872361). A message whose create_time is unusable (missing, null, another
+type, NaN/±inf, out of range) is kept: its time is inferred for the window and
+the sort order only, its donated time is empty, and it is reported as an issue
+with action "message_kept".
 """
 
 import calendar
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import heapq
@@ -102,19 +108,59 @@ def _hidden_flag(value: Any) -> bool:
     raise _FormatChange("invalid_hidden_flag")
 
 
-def _invalid_timestamp(value: Any) -> _FormatChange:
-    """Name the JSON type of the value (str, float, bool, ...), never the value."""
-    return _FormatChange(f"invalid_timestamp:{type(value).__name__}")
+def _local_time(created: datetime) -> str:
+    return created.astimezone().strftime("%Y-%m-%d %H:%M:%S")
 
 
-def _timestamp(value: Any) -> datetime:
-    """Exports use Unix seconds as numbers; any other encoding is a format change."""
+def _timestamp(value: Any) -> datetime | None:
+    """Exports use Unix seconds as numbers; anything else is unusable (None).
+
+    So is a number that UTC or local time cannot represent (NaN, ±inf,
+    milliseconds, ...).
+    """
     if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise _invalid_timestamp(value)
+        return None
     try:
-        return datetime.fromtimestamp(value, timezone.utc)
+        created = datetime.fromtimestamp(value, timezone.utc)
+        _local_time(created)
     except (ValueError, OverflowError, OSError):
-        raise _invalid_timestamp(value) from None
+        return None
+    return created
+
+
+def _ancestor_time(mapping: dict, node: dict) -> datetime | None:
+    """Time of the nearest dated ancestor via parent links, at most 64 steps up.
+
+    Mapping order is node-id order, not time order: a parent may come after
+    its child, so the previous node in the file is no substitute.
+    """
+    for _ in range(64):
+        parent_id = node.get("parent")
+        parent = mapping.get(parent_id) if isinstance(parent_id, str) else None
+        if not isinstance(parent, dict):
+            return None
+        message = parent.get("message")
+        created = _timestamp(message.get("create_time")) if isinstance(message, dict) else None
+        if created is not None:
+            return created
+        node = parent
+    return None
+
+
+def _inferred_time(
+    mapping: dict, node: dict, updated: datetime | None, created: datetime | None
+) -> tuple[datetime | None, datetime | None]:
+    """(inferred time, window time) for a message without a usable time.
+
+    The inferred time is the nearest dated ancestor's, else the conversation's
+    update_time, then its create_time. The window time is the later of the
+    inferred time and the conversation's update_time: in doubt, keep.
+    """
+    inferred = _ancestor_time(mapping, node)
+    if inferred is None:
+        inferred = updated if updated is not None else created
+    window_time = max((time for time in (inferred, updated) if time is not None), default=None)
+    return inferred, window_time
 
 
 def _content_text(content: Any) -> str:
@@ -168,11 +214,17 @@ def _validate_leaves(part: Any) -> None:
 
 
 def _message_fields(
-    message: Any, current: datetime, cutoff: datetime | None
-) -> tuple[datetime, str, str, str, str] | None:
-    """(created, role, text, model, local time), or None if hidden.
+    message: Any,
+    current: datetime,
+    cutoff: datetime | None,
+    infer: Callable[[], tuple[datetime | None, datetime | None]],
+) -> tuple[datetime, str, str, str, str, str | None] | None:
+    """(sort time, role, text, model, local time, kept reason), or None if hidden.
 
-    Raises _OutsideWindow for a message older than the cutoff.
+    Without a usable create_time, the window and sort order use the inferred
+    time, the local time is empty and the kept reason names the value's type.
+    A message whose time cannot be inferred at all counts as current, so it
+    sorts first. Raises _OutsideWindow for a message older than the cutoff.
     """
     if not isinstance(message, dict):
         raise _FormatChange("invalid_message")
@@ -183,17 +235,22 @@ def _message_fields(
         raise _FormatChange("invalid_metadata")
     if _hidden_flag(metadata.get("is_visually_hidden_from_conversation")):
         return None
-    if "create_time" not in message:
-        raise _Skip("missing_timestamp:absent")
-    create_time = message["create_time"]
-    if create_time is None:
-        # Publicly described for system messages without the hidden flag
-        # (Flux 10507872361). Other encodings remain format changes.
-        raise _Skip("missing_timestamp:NoneType")
-    created = _timestamp(create_time)
-    if created > current:
+    created = _timestamp(message.get("create_time"))
+    kept = None
+    if created is None:
+        # Type only, never the value; "absent" for a missing key.
+        value_type = type(message["create_time"]).__name__ if "create_time" in message else "absent"
+        created, window_time = infer()
+        if created is None:
+            created = window_time = current
+            kept = f"timestamp_unknown_kept:{value_type}"
+        else:
+            kept = f"timestamp_inferred:{value_type}"
+    elif created > current:
         raise _Skip("future_timestamp")
-    if cutoff is not None and created < cutoff:
+    else:
+        window_time = created
+    if cutoff is not None and window_time < cutoff:
         raise _OutsideWindow
     author = message.get("author")
     role = author.get("role") if isinstance(author, dict) else None
@@ -209,11 +266,9 @@ def _message_fields(
     text = _content_text(message.get("content"))
     if not _valid_text(role) or not _valid_text(model):
         raise _Skip("invalid_text")
-    try:
-        local_time = created.astimezone().strftime("%Y-%m-%d %H:%M:%S")
-    except (ValueError, OverflowError, OSError):
-        raise _invalid_timestamp(create_time) from None
-    return created, role, text, model, local_time
+    # Never donate an inferred time.
+    local_time = "" if kept else _local_time(created)
+    return created, role, text, model, local_time, kept
 
 
 def months_before(value: datetime, months: int) -> datetime:
@@ -234,7 +289,8 @@ def extract_conversations(
     window_months=None disables the date cutoff. max_data_bytes optionally bounds
     the compact UTF-8 JSON row array, retaining a newest-first prefix of whole
     messages. Raises UnsupportedExportFormat at the first format change.
-    Skipped messages are returned as issues. Locations are
+    Skipped messages, and kept messages without a usable time, are returned
+    as issues. Locations are
     1-based positions across the whole export (all parts), never export IDs or
     participant text. Conversations are consumed once, in order, so a lazy
     iterable keeps only the current export part in memory. Hidden messages and
@@ -259,12 +315,14 @@ def extract_conversations(
     sequence = 0
     discarded_through = None
 
-    def issue(conversation: int, message: int | None, reason: str) -> None:
+    def issue(conversation: int, message: int | None, reason: str, action: str | None = None) -> None:
+        if action is None:
+            action = "conversation_excluded" if message is None else "message_excluded"
         issues.append({
             "conversation": str(conversation),
             "message": "" if message is None else str(message),
             "reason": reason,
-            "action": "conversation_excluded" if message is None else "message_excluded",
+            "action": action,
         })
 
     for conversation_position, conversation in enumerate(conversations, start=1):
@@ -279,6 +337,8 @@ def extract_conversations(
         if not _valid_text(title):
             issue(conversation_position, None, "invalid_text")
             continue
+        conversation_updated = _timestamp(conversation.get("update_time"))
+        conversation_created = _timestamp(conversation.get("create_time"))
         for message_position, node in enumerate(mapping.values(), start=1):
             if not isinstance(node, dict) or "message" not in node:
                 raise UnsupportedExportFormat("invalid_message", conversation_position, message_position)
@@ -286,7 +346,10 @@ def extract_conversations(
             if message is None and node.get("parent") is None:
                 continue
             try:
-                fields = _message_fields(message, current, cutoff)
+                fields = _message_fields(
+                    message, current, cutoff,
+                    lambda: _inferred_time(mapping, node, conversation_updated, conversation_created),
+                )
             except _FormatChange as error:
                 raise UnsupportedExportFormat(
                     error.reason, conversation_position, message_position
@@ -299,13 +362,15 @@ def extract_conversations(
                 continue
             if fields is None:
                 continue
-            created, role, text, model, local_time = fields
+            sort_time, role, text, model, local_time, kept = fields
             # The encounter index preserves stable ordering for equal timestamps.
-            key = (created, -sequence)
+            key = (sort_time, -sequence)
             sequence += 1
             if discarded_through is not None and key <= discarded_through:
                 outside_byte_limit += 1
                 continue
+            if kept is not None:
+                issue(conversation_position, message_position, kept, "message_kept")
             row = {
                 "conversation title": title,
                 "role": role,

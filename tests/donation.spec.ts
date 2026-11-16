@@ -209,6 +209,30 @@ test('skips unusable messages and reports them only in the tracking donation', a
   expect(raw).not.toContain(secretText);
 });
 
+test('keeps a message without a usable timestamp for review, with an empty time', async ({ page }) => {
+  const donations = await uploadChatGPTExport(page, [{
+    title: secretTitle,
+    mapping: {
+      valid: messageNode('Newest answer', newestTimestamp),
+      undated: messageNode(secretText, null),
+    },
+  }]);
+
+  // Without a time to infer, it is listed first so the participant sees it.
+  const table = page.getByTestId('table-chatgpt_conversations_1');
+  await expect(table.getByText(secretText)).toBeVisible();
+  await expect(page.getByText('We found 2 messages from the last 12 months', { exact: false })).toBeVisible();
+  await page.getByRole('checkbox').first().click();
+  await table.getByRole('checkbox').nth(1).click();
+  await page.getByText('Delete selected').first().click();
+  await expect(table.getByText(secretText)).not.toBeVisible();
+
+  const { tables, tracking, raw } = await submitDonation(page, donations);
+  expect(tables.chatgpt_conversations_1.data).toEqual([{ ...newestRow, 'conversation title': secretTitle }]);
+  expect(tracking).toContain('timestamp_unknown_kept:NoneType message_kept=1');
+  expect(raw).not.toContain(secretText);
+});
+
 test('still asks to donate an empty export', async ({ page }) => {
   const donations = await openDonation(page);
   await chooseExport(page, exportFile([{ title: secretTitle, mapping: {} }]));
@@ -235,13 +259,13 @@ test('rejects a changed export format at once and tracks the reason', async ({ p
   const donations = await openDonation(page);
   await chooseExport(page, exportFile([
     { title: secretTitle, mapping: { valid: messageNode('Newest answer', newestTimestamp) } },
-    { title: secretTitle, mapping: { changed: messageNode(secretText, '2026-09-20T12:00:00Z') } },
+    { title: 7, mapping: { changed: messageNode(secretText, newestTimestamp) } },
   ]));
 
   await expect(page.getByRole('button', { name: 'Try again' })).toBeVisible();
   await expect(page.getByText('Yes, donate', { exact: true })).not.toBeVisible();
   await expect.poll(() => latestTracking(donations))
-    .toContain('unsupported format, reason=invalid_timestamp:str conversation=2 message=1');
+    .toContain('unsupported format, reason=invalid_title conversation=2');
   expect(JSON.stringify(donations)).not.toContain('SECRET');
 
   await page.getByRole('button', { name: 'Try again' }).click();
