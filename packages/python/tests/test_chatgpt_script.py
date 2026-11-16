@@ -364,7 +364,7 @@ def test_format_change_rejects_export_and_logs_its_position(tmp_path, caplog):
     with caplog.at_level("WARNING", logger="port.script"):
         assert script.extract_export(write_export(tmp_path, payload), now=NOW) == (None, "unsupported_format")
     assert caplog.records[-1].getMessage() == (
-        "Rejected ChatGPT export: unsupported format, reason=invalid_timestamp conversation=2 message=1"
+        "Rejected ChatGPT export: unsupported format, reason=invalid_timestamp:str conversation=2 message=1"
     )
     assert "PRIVATE" not in caplog.text
 
@@ -467,16 +467,89 @@ def test_undated_hidden_messages_and_root_placeholders_are_ignored(tmp_path):
     assert extraction.issues.empty
 
 
+def unflagged_system_message() -> dict:
+    """Older export shape at message 2, the first node after the root
+    placeholder: an undated system message without the hidden flag. Publicly
+    described, not observed in our real exports (Flux 10507872361)."""
+    return {
+        "message": {
+            "author": {"role": "system", "name": None, "metadata": {}},
+            "create_time": None,
+            "update_time": None,
+            "content": {"content_type": "text", "parts": [""]},
+            "weight": 0.0,
+            "metadata": {},
+        }
+    }
+
+
+def old_format_conversation(title: str, created_at: float, text: str) -> dict:
+    return conversation(title, [
+        {"message": None, "parent": None},
+        unflagged_system_message(),
+        message("user", created_at, [text]),
+    ])
+
+
+def test_undated_unflagged_system_message_is_skipped_not_rejected(tmp_path, caplog):
+    # Flux 10507872361: CAIS exports were rejected at message 2 with
+    # invalid_timestamp. The undated message is skipped and counted instead.
+    payload = [
+        conversation("Recent", [
+            {"message": None, "parent": None},
+            undated(message("system", 0, [""], hidden=True)),
+            message("user", timestamp(2026, 9, 20), ["Recent"]),
+        ]),
+        old_format_conversation("PRIVATE_TITLE", timestamp(2026, 9, 19), "PRIVATE_TEXT"),
+    ]
+    with caplog.at_level("WARNING", logger="port.script"):
+        extraction, problem = script.extract_export(write_export(tmp_path, payload), now=NOW)
+    assert problem is None
+    assert extraction.messages["message"].tolist() == ["Recent", "PRIVATE_TEXT"]
+    assert extraction.issues.to_dict("records") == [
+        {"conversation": "2", "message": "2", "reason": "missing_timestamp:NoneType", "action": "message_excluded"}
+    ]
+    warnings = [record.getMessage() for record in caplog.records if record.name == "port.script"]
+    assert warnings == ["Processing issues: missing_timestamp:NoneType message_excluded=1"]
+    assert "PRIVATE" not in caplog.text
+
+
 @pytest.mark.parametrize("window", [12, None])
-def test_undated_visible_message_rejects_the_export_whatever_the_window(tmp_path, monkeypatch, window):
-    # It cannot be placed inside or outside the window, and none were observed
-    # in real exports: like any unobserved timestamp it is a format change.
+def test_undated_visible_message_is_skipped_whatever_the_window(tmp_path, monkeypatch, window):
+    # It cannot be placed inside or outside the window: it is skipped and counted.
     monkeypatch.setattr(script, "TIME_WINDOW_MONTHS", window)
+    absent = message("assistant", 0, ["Undated"])
+    del absent["message"]["create_time"]
     payload = [conversation("Mixed", [
         message("user", timestamp(2026, 9, 20), ["Recent"]),
         undated(message("assistant", 0, ["Undated"])),
+        absent,
     ])]
-    assert script.extract_export(write_export(tmp_path, payload), now=NOW) == (None, "unsupported_format")
+    extraction, problem = script.extract_export(write_export(tmp_path, payload), now=NOW)
+    assert problem is None
+    assert extraction.messages["message"].tolist() == ["Recent"]
+    assert extraction.issues["reason"].tolist() == ["missing_timestamp:NoneType", "missing_timestamp:absent"]
+
+
+def test_old_export_with_undated_system_messages_still_reaches_consent(tmp_path, caplog):
+    payload = [old_format_conversation("PRIVATE_TITLE", timestamp(2023, 5, 1), "PRIVATE_TEXT")]
+    with caplog.at_level("INFO", logger="port.script"):
+        extraction, problem = script.extract_export(write_export(tmp_path, payload), now=NOW)
+    assert problem is None
+    assert extraction.messages.empty
+    assert extraction.outside_window == 1
+    assert (
+        "No messages to donate: all dated messages are outside the time window; undated messages were skipped"
+    ) in caplog.text
+
+
+@pytest.mark.parametrize("payload", [
+    [conversation("Undated", [undated(message("user", 0, ["Undated"]))])],
+    [old_format_conversation("Mixed", timestamp(2023, 5, 1), "Old"),
+     conversation("Canvas", [canvas_message(timestamp(2026, 9, 20))])],
+])
+def test_export_with_only_undated_or_other_skipped_messages_is_unusable(tmp_path, payload):
+    assert script.extract_export(write_export(tmp_path, payload), now=NOW) == (None, "unusable")
 
 
 FLOW = textwrap.dedent("""
@@ -536,7 +609,7 @@ def test_tracking_records_a_format_change_rejection(tmp_path):
     donations = run_flow(write_export(tmp_path, payload))
     assert {key for key, _ in donations} == {"s-tracking"}
     tracking = "\n".join(donations[-1][1])
-    assert "unsupported format, reason=invalid_timestamp conversation=1 message=1" in tracking
+    assert "unsupported format, reason=invalid_timestamp:str conversation=1 message=1" in tracking
     assert "Skipped during retry flow" in tracking
     assert "PRIVATE" not in tracking
 

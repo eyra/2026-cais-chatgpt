@@ -62,18 +62,23 @@ that accepts only the observed format and reports anything else ("fail soon"):
   a field or be appended to message text. Message text is retained verbatim,
   including markdown and ChatGPT's inline citation markers.
 - As in the reference: all mapping branches (edited prompts, regenerated
-  answers) are donated; non-text parts are flattened into their scalar values
-  (e.g. image pointer and dimensions, `None` for nulls); reasoning messages
-  (`thoughts`, `reasoning_recap`) are rows with an empty message.
+  answers) are donated; scalar parts are joined as text (`None` for nulls);
+  reasoning messages (`thoughts`, `reasoning_recap`) are rows with an empty
+  message. One deviation: each object or list part, such as an image pointer,
+  is donated as `[image]` instead of its flattened fields, so no file ids are
+  donated.
 - Only observed encodings are accepted: timestamps as numeric Unix seconds, the
   hidden flag as a boolean (normally absent), titles as strings. Absent model
   or metadata (user messages) is an empty model.
 - Messages without a timestamp: hidden messages (such as the system prompt)
   and empty root placeholders are skipped before the timestamp is read, as
-  before. A visible message without a numeric `create_time` cannot be placed
-  inside or outside the time window and was never observed in real exports, so,
-  like any other unobserved timestamp encoding, it is a format change that
-  rejects the export with the support guidance below.
+  before. A visible message whose `create_time` is null or missing, such as the
+  undated system message without a hidden flag in older exports, cannot be
+  placed inside or outside the time window: it is skipped and counted in the
+  tracking log as `missing_timestamp:NoneType` or `missing_timestamp:absent`.
+  Any other unobserved encoding (strings, out-of-range or non-finite numbers)
+  is a format change that rejects the export with the support guidance below,
+  logged as `invalid_timestamp:<type>`: the JSON type, never the value.
 - The table shows messages newest first. The time window is
   `TIME_WINDOW_MONTHS` in `port/script.py`, currently set to **`12`**: only
   messages from the last 12 calendar months (UTC) before upload are offered for

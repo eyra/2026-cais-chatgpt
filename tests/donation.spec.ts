@@ -241,7 +241,7 @@ test('rejects a changed export format at once and tracks the reason', async ({ p
   await expect(page.getByRole('button', { name: 'Try again' })).toBeVisible();
   await expect(page.getByText('Yes, donate', { exact: true })).not.toBeVisible();
   await expect.poll(() => latestTracking(donations))
-    .toContain('unsupported format, reason=invalid_timestamp conversation=2 message=1');
+    .toContain('unsupported format, reason=invalid_timestamp:str conversation=2 message=1');
   expect(JSON.stringify(donations)).not.toContain('SECRET');
 
   await page.getByRole('button', { name: 'Try again' }).click();

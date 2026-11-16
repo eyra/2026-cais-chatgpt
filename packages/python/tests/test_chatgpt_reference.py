@@ -227,7 +227,7 @@ def test_conversation_format_change_rejects_export_at_first_occurrence(bad, reas
     (node(content=None), "invalid_content"),
     (node(content={"parts": "not a list"}), "invalid_content"),
     (node(content={"parts": ["valid prefix", float("nan")]}), "invalid_content"),
-    (node(create_time="2026-01-15T12:00:00Z"), "invalid_timestamp"),
+    (node(create_time="2026-01-15T12:00:00Z"), "invalid_timestamp:str"),
 ])
 def test_message_format_change_rejects_export_with_position_only(bad, reason):
     with pytest.raises(chatgpt.UnsupportedExportFormat) as raised:
@@ -248,6 +248,22 @@ def test_unusable_message_is_skipped_and_reported_without_losing_siblings(conten
     assert result.issues.to_dict("records") == [{"conversation": "1", "message": "1", "reason": reason, "action": "message_excluded"}]
 
 
+def test_null_or_missing_timestamp_is_skipped_and_reported_by_type():
+    missing = node()
+    del missing["message"]["create_time"]
+    result = extract(conversation({"null": node(create_time=None), "missing": missing, "valid": node()}))
+    assert result.messages["message"].tolist() == ["Hello world"]
+    assert result.issues["reason"].tolist() == ["missing_timestamp:NoneType", "missing_timestamp:absent"]
+
+
+def test_hidden_message_without_timestamp_key_is_ignored_without_issue():
+    hidden = node(metadata={"is_visually_hidden_from_conversation": True})
+    del hidden["message"]["create_time"]
+    result = extract(conversation({"hidden": hidden, "valid": node()}))
+    assert result.messages["message"].tolist() == ["Hello world"]
+    assert result.issues.empty
+
+
 @pytest.mark.parametrize("timestamp", [CREATED, int(CREATED)])
 def test_numeric_unix_seconds_are_the_supported_timestamp(timestamp, local_zone):
     local_zone("UTC")
@@ -256,14 +272,17 @@ def test_numeric_unix_seconds_are_the_supported_timestamp(timestamp, local_zone)
     assert result.issues.empty
 
 
-@pytest.mark.parametrize("timestamp", [
-    None, True, {}, "", str(CREATED), CREATED * 1000, "2026-01-15T12:00:00Z",
-    float("nan"), float("inf"), float("-inf"), 1e30, -(10**400),
+@pytest.mark.parametrize("timestamp, value_type", [
+    (True, "bool"), ({}, "dict"), ("", "str"), (str(CREATED), "str"),
+    (CREATED * 1000, "float"), ("2026-01-15T12:00:00Z", "str"),
+    (float("nan"), "float"), (float("inf"), "float"), (float("-inf"), "float"), (1e30, "float"),
+    (-(10**400), "int"),
 ])
-def test_unobserved_timestamp_encodings_are_format_changes(timestamp):
+def test_unobserved_timestamp_encodings_are_format_changes(timestamp, value_type):
+    # The reason names the type, so AppSignal shows the encoding without the value.
     with pytest.raises(chatgpt.UnsupportedExportFormat) as raised:
         extract(conversation({"bad": node(create_time=timestamp)}))
-    assert raised.value.reason == "invalid_timestamp"
+    assert raised.value.reason == f"invalid_timestamp:{value_type}"
 
 
 @pytest.mark.parametrize("now", [NOW, NOW.replace(tzinfo=None), NOW.astimezone(timezone(timedelta(hours=5, minutes=30)))])
