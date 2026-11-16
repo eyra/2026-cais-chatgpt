@@ -395,7 +395,7 @@ def test_export_with_only_future_messages_reaches_consent_with_them(tmp_path):
 
 @pytest.mark.parametrize("payload", [
     [{"title": "PRIVATE_TITLE", "mapping": None}, "PRIVATE", None],
-    [conversation("Invalid", [{"message": ["PRIVATE"]}, "PRIVATE", {"no message": True}])],
+    [conversation("Invalid", [{"message": ["PRIVATE"]}, "PRIVATE", {"message": None, "parent": "node-0"}])],
 ])
 def test_export_without_any_readable_conversation_reaches_consent_not_rejected(tmp_path, caplog, payload):
     with caplog.at_level("INFO", logger="port.script"):

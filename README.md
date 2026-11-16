@@ -134,16 +134,17 @@ dropped without being counted.
   `invalid_text:<field>`). Metadata that is not an object is read as empty,
   and a hidden flag that is not a boolean as "not hidden", so the participant
   sees the message (`invalid_metadata:<type>`, `invalid_hidden_flag:<type>`).
-  A text part that cannot be read (a non-finite number, an isolated
-  surrogate) becomes `[unreadable]`; the other parts are kept. Object and list
-  parts are `[image]` whatever their fields, which are never read. Messages
-  with an unusable or future timestamp are kept as described above.
+  Content that is not an object with a list of parts becomes `[unreadable]`
+  (`invalid_content:<type>`), as does a text part that cannot be read (a
+  non-finite number, an isolated surrogate); the other parts are kept. Object
+  and list parts are `[image]` whatever their fields, which are never read.
+  Messages with an unusable or future timestamp are kept as described above.
+  These issues are reported only for messages that are donated.
 - **Skipped** (`message_excluded`, `conversation_excluded`), because nothing
   readable remains: a conversation that is not an object or has no `mapping`
-  object (`invalid_conversation:<type>`, `invalid_mapping:<type>`), a node
-  without a message object (`invalid_message:<type>`), or content that is not
-  an object with a list of parts (`invalid_content:<type>`), including an
-  unknown content type without `parts` (`unknown_content_type:<label>`). Only
+  object (`invalid_conversation:<type>`, `invalid_mapping:<type>`), or a node
+  without a message object (`invalid_message:<type>`). An unknown content
+  type without `parts` is skipped too (`unknown_content_type:<label>`). Only
   that message or conversation is skipped. If nothing remains, the participant
   still reaches the consent step with an empty table.
 

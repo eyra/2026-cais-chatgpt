@@ -12,11 +12,12 @@ A problem in a conversation or message never rejects the export (Flux
 dropped without an issue. Issues carry a reason with the value's type, never
 the value, and one of these actions:
 - message_kept / conversation_kept: a field could not be read and is empty
-  (title, role, model) or a placeholder (UNREADABLE_PART for a text part), or
-  the time was unusable or in the future (see _message_fields).
+  (title, role, model) or UNREADABLE_PART (content or a text part), or the
+  time was unusable or in the future (see _message_fields). Reported only
+  for messages that are donated.
 - message_excluded / conversation_excluded: nothing readable remains (no
-  message object, content that is not a list of parts, an unknown content
-  type, a conversation without a mapping).
+  message object, a conversation without a mapping), or the content type is
+  unknown.
 """
 
 import calendar
@@ -153,18 +154,20 @@ def _inferred_time(
     return inferred, None if updated is None else max(inferred, updated)
 
 
-def _content_text(content: Any, kept: list[str]) -> str:
+def _content_text(message: dict, kept: list[str]) -> str:
     """Join the parts; each object or list part becomes NON_TEXT_PART.
 
     The reference flattens an object part (an image asset pointer) into its
     str()-converted scalar leaves, which donates file ids as text; CAIS donates
     a placeholder instead (Flux 10452034951), so such a part is not read
     further. Scalar parts are str()-converted as in the reference; one that
-    cannot be read becomes UNREADABLE_PART. Raises _Skip if the content has no
-    readable parts at all.
+    cannot be read becomes UNREADABLE_PART, as does content that is not an
+    object with a list of parts. Raises _Skip for an unknown content type.
     """
+    content = message.get("content")
     if not isinstance(content, dict):
-        raise _Skip(f"invalid_content:{type(content).__name__}")
+        kept.append(f"invalid_content:{_type_name(message, 'content')}")
+        return UNREADABLE_PART
     if "parts" not in content:
         content_type = content.get("content_type")
         if content_type in EMPTY_TEXT_CONTENT_TYPES:
@@ -172,7 +175,8 @@ def _content_text(content: Any, kept: list[str]) -> str:
         raise _Skip(f"unknown_content_type:{_label(content_type)}")
     parts = content["parts"]
     if not isinstance(parts, list):
-        raise _Skip(f"invalid_content:{type(parts).__name__}")
+        kept.append(f"invalid_content:{type(parts).__name__}")
+        return UNREADABLE_PART
     texts = []
     for part in parts:
         if isinstance(part, (dict, list)):
@@ -214,7 +218,7 @@ def _message_fields(
     hidden = metadata.get("is_visually_hidden_from_conversation")
     if hidden is True:
         return None
-    if hidden not in (None, False):
+    if hidden is not None and hidden is not False:
         # Only booleans have been observed; in doubt, show the message.
         kept.append(f"invalid_hidden_flag:{type(hidden).__name__}")
     created = _timestamp(message.get("create_time"))
@@ -248,7 +252,7 @@ def _message_fields(
     else:
         role = _text_field(author, "role", "role", kept)
     model = _text_field(metadata, "model_slug", "model", kept)
-    text = _content_text(message.get("content"), kept)
+    text = _content_text(message, kept)
     # One issue per reason and message.
     return created, role, text, model, local_time, list(dict.fromkeys(kept))
 
@@ -295,6 +299,7 @@ def extract_conversations(
     row_bytes = 0
     sequence = 0
     discarded_through = None
+    title_kept: dict[int, list[str]] = {}
 
     def issue(conversation: int, message: int | None, reason: str, action: str | None = None) -> None:
         if action is None:
@@ -316,8 +321,9 @@ def extract_conversations(
             continue
         title_issues: list[str] = []
         title = _text_field(conversation, "title", "title", title_issues)
-        for reason in title_issues:
-            issue(conversation_position, None, reason, "conversation_kept")
+        if title_issues:
+            # Reported once a message of the conversation is donated.
+            title_kept[conversation_position] = title_issues
         conversation_updated = _timestamp(conversation.get("update_time"))
         conversation_created = _timestamp(conversation.get("create_time"))
         node_times: dict[str, datetime | None] = {}
@@ -326,8 +332,8 @@ def extract_conversations(
                 issue(conversation_position, message_position, f"invalid_message:{type(node).__name__}")
                 continue
             message = node.get("message")
-            if message is None and node.get("parent") is None and "message" in node:
-                continue
+            if message is None and node.get("parent") is None:
+                continue  # A root placeholder.
             if not isinstance(message, dict):
                 issue(conversation_position, message_position, f"invalid_message:{_type_name(node, 'message')}")
                 continue
@@ -381,9 +387,14 @@ def extract_conversations(
                 # later, older small message could bypass an oversized newer one.
 
     rows.sort(reverse=True)
-    for *_, row in sorted(rows, key=lambda entry: -entry[1]):
+    for *_, row in rows:
         for conversation, message, reason in row["_kept"]:
             issue(conversation, message, reason, "message_kept")
+    for conversation in {row["_conversation"] + 1 for *_, row in rows} & title_kept.keys():
+        for reason in title_kept[conversation]:
+            issue(conversation, None, reason, "conversation_kept")
+    # In export order: conversation issues before their messages' issues.
+    issues.sort(key=lambda item: (int(item["conversation"]), int(item["message"] or 0)))
     return ExtractionResult(
         messages=pd.DataFrame([row[3] for row in rows], columns=[*MESSAGE_COLUMNS, "_conversation"]),
         issues=pd.DataFrame(issues, columns=ISSUE_COLUMNS, dtype=str),

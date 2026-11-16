@@ -1,7 +1,7 @@
 """Public extraction contracts. Donated values mirror the Utrecht reference,
 verified message-by-message against real exports, except that an object or
-list part of a message (an image) is donated as a placeholder; only observed
-encodings are accepted."""
+list part of a message (an image) is donated as a placeholder; anything else
+is kept as far as it can be read, never rejected."""
 
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
@@ -139,6 +139,50 @@ def test_object_part_is_replaced_without_reading_its_fields():
     assert result.issues.empty
 
 
+@pytest.mark.parametrize("content", [
+    {"content_type": "thoughts", "thoughts": [{"summary": "s", "content": "private reasoning"}], "source_analysis_msg_id": "x"},
+    {"content_type": "reasoning_recap", "content": "Thought for 5s"},
+])
+def test_reasoning_messages_are_rows_with_empty_message_like_the_reference(content):
+    result = extract(conversation({"node": node(author={"role": "assistant"}, content=content)}))
+    assert result.messages[["role", "message", "model"]].values.tolist() == [["assistant", "", "gpt-4"]]
+    assert result.issues.empty
+
+
+def test_all_branches_and_duplicate_titles_keep_stable_independent_identity():
+    source = conversation({
+        "root": {"message": None, "parent": None},
+        "left": node(content={"parts": ["left"]}),
+        "right": node(content={"parts": ["right"]}),
+        "newer": node(content={"parts": ["newer"]}, create_time=CREATED + 1),
+    }, current_node="left")
+    result = extract(source, conversation({"same-id": node(content={"parts": ["other conversation"]})}))
+    assert result.messages["message"].tolist() == ["newer", "left", "right", "other conversation"]
+    assert result.messages["_conversation"].tolist() == [0, 0, 0, 1]
+    assert result.issues.empty
+
+
+@pytest.mark.parametrize("metadata", [None, {}, {"model_slug": None}])
+def test_optional_model_metadata_and_unlisted_role_are_supported(metadata):
+    result = extract(conversation({"node": node(author={"role": "custom-tool"}, metadata=metadata)}, title=""))
+    assert result.messages[["conversation title", "role", "model"]].values.tolist() == [["", "custom-tool", ""]]
+    assert result.issues.empty
+
+
+def test_absent_metadata_is_an_empty_model():
+    source = conversation()
+    del source["mapping"]["turn"]["message"]["metadata"]
+    result = extract(source)
+    assert result.messages[["message", "model"]].values.tolist() == [["Hello world", ""]]
+    assert result.issues.empty
+
+
+def test_hidden_messages_skip_invalid_remaining_fields():
+    result = extract(conversation({"hidden": {"message": {"metadata": {"is_visually_hidden_from_conversation": True, "model_slug": []}}}}))
+    assert result.messages.empty
+    assert result.issues.empty
+
+
 @pytest.mark.parametrize("flag", [None, False])
 def test_false_hidden_flags_keep_messages(flag):
     result = extract(conversation({"visible": node(metadata={"is_visually_hidden_from_conversation": flag})}))
@@ -172,6 +216,18 @@ def test_unreadable_title_keeps_the_conversation_with_an_empty_title(title, reas
     ]
 
 
+def test_unreadable_title_is_not_reported_when_no_message_is_donated():
+    result = extract(conversation({"old": node(create_time=OLD)}, title=3), window_months=12)
+    assert result.messages.empty
+    assert result.issues.empty
+
+
+def test_root_node_without_a_message_key_is_a_placeholder():
+    result = extract(conversation({"root": {"parent": None, "children": ["turn"]}, "turn": node()}))
+    assert result.messages["message"].tolist() == ["Hello world"]
+    assert result.issues.empty
+
+
 def test_missing_title_keeps_the_conversation_with_an_empty_title():
     source = conversation()
     del source["title"]
@@ -182,14 +238,11 @@ def test_missing_title_keeps_the_conversation_with_an_empty_title():
 
 @pytest.mark.parametrize("bad, reason", [
     (None, "invalid_message:NoneType"), ("private", "invalid_message:str"),
-    ({}, "invalid_message:absent"),
+    ({"parent": "parent-id"}, "invalid_message:absent"),
     ({"message": None, "parent": "parent-id"}, "invalid_message:NoneType"),
     ({"message": []}, "invalid_message:list"),
-    (node(content=None), "invalid_content:NoneType"),
-    (node(content="private"), "invalid_content:str"),
-    (node(content={"parts": "private"}), "invalid_content:str"),
 ])
-def test_message_without_readable_content_is_excluded_not_rejected(bad, reason):
+def test_node_without_a_message_object_is_excluded_not_rejected(bad, reason):
     result = extract(conversation({"valid": node(), "bad": bad}))
     assert result.messages["message"].tolist() == ["Hello world"]
     assert result.issues.to_dict("records") == [
@@ -198,11 +251,22 @@ def test_message_without_readable_content_is_excluded_not_rejected(bad, reason):
     assert "private" not in result.issues.to_json()
 
 
+def without_content():
+    value = node()
+    del value["message"]["content"]
+    return value
+
+
 @pytest.mark.parametrize("bad, row, reason", [
+    (node(content=None), ("user", "[unreadable]", "gpt-4"), "invalid_content:NoneType"),
+    (without_content(), ("user", "[unreadable]", "gpt-4"), "invalid_content:absent"),
+    (node(content="private"), ("user", "[unreadable]", "gpt-4"), "invalid_content:str"),
+    (node(content={"parts": "private"}), ("user", "[unreadable]", "gpt-4"), "invalid_content:str"),
     (node(metadata="private"), ("user", "Hello world", ""), "invalid_metadata:str"),
     # Only booleans have been observed; in doubt, the message is shown.
     (node(metadata={"is_visually_hidden_from_conversation": "true"}), ("user", "Hello world", ""), "invalid_hidden_flag:str"),
     (node(metadata={"is_visually_hidden_from_conversation": 1}), ("user", "Hello world", ""), "invalid_hidden_flag:int"),
+    (node(metadata={"is_visually_hidden_from_conversation": 0}), ("user", "Hello world", ""), "invalid_hidden_flag:int"),
     (node(author=None), ("", "Hello world", "gpt-4"), "invalid_role:NoneType"),
     (node(author={}), ("", "Hello world", "gpt-4"), "invalid_role:absent"),
     (node(author={"role": None}), ("", "Hello world", "gpt-4"), "invalid_role:NoneType"),
@@ -464,9 +528,9 @@ def test_issue_locations_are_input_positions_and_never_contain_private_data(caps
     assert result.messages["message"].tolist() == [private, "Hello world", "Hello world"]
     assert result.messages["conversation title"].tolist() == [private, private, ""]
     assert result.issues.to_dict("records") == [
+        {"conversation": "1", "message": "2", "reason": "timestamp_future_kept", "action": "message_kept"},
         {"conversation": "1", "message": "3", "reason": "unknown_content_type:canvas", "action": "message_excluded"},
         {"conversation": "2", "message": "", "reason": "invalid_text:title", "action": "conversation_kept"},
-        {"conversation": "1", "message": "2", "reason": "timestamp_future_kept", "action": "message_kept"},
     ]
     assert "private" not in result.issues.to_json()
     captured = capsys.readouterr()
