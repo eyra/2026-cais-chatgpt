@@ -11,6 +11,10 @@ export interface LogEntry {
 
 type FlushCallback = (entries: LogEntry[]) => void
 
+// Browsers report this when a ResizeObserver callback changes layout; it is harmless and
+// is not forwarded (Chromium and Firefox use this text).
+const RESIZE_OBSERVER_LOOP = 'ResizeObserver loop completed with undelivered notifications.'
+
 export interface Logger {
   log(level: LogLevel, message: string, context?: Record<string, unknown>): void
   flush(): void
@@ -31,6 +35,7 @@ export class WindowLogSource {
     }
 
     window.addEventListener('error', (event) => {
+      if (event.message === RESIZE_OBSERVER_LOOP) return
       logger.log('error', event.message, {
         filename: event.filename,
         lineno: event.lineno,
